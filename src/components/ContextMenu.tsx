@@ -18,6 +18,9 @@ export function ContextMenuProvider({ children }: { children: React.ReactNode })
   const [menu, setMenu] = useState<MenuState | null>(null);
   const [menuClosing, setMenuClosing] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
+  const editableTargetRef = useRef<HTMLInputElement | HTMLTextAreaElement | HTMLElement | null>(
+    null,
+  );
   const tileCtrlCloseRef = useRef(true);
   const tileContextMenuItems = useMemo(() => getTileContextMenuItems(t), [t]);
 
@@ -53,7 +56,10 @@ export function ContextMenuProvider({ children }: { children: React.ReactNode })
         requestSurfaceAction("close");
         return;
       }
-      const selection = window.getSelection()?.toString() || "";
+      let selection = window.getSelection()?.toString() || "";
+      if (target instanceof HTMLTextAreaElement || target instanceof HTMLInputElement) {
+        selection = target.value.slice(target.selectionStart ?? 0, target.selectionEnd ?? 0);
+      }
 
       let x = event.clientX;
       let y = event.clientY;
@@ -63,6 +69,7 @@ export function ContextMenuProvider({ children }: { children: React.ReactNode })
       if (y + menuHeight > window.innerHeight) y = window.innerHeight - menuHeight - 4;
 
       if (tileTarget) {
+        editableTargetRef.current = null;
         setMenuClosing(false);
         setMenu({
           x,
@@ -73,6 +80,7 @@ export function ContextMenuProvider({ children }: { children: React.ReactNode })
         return;
       }
 
+      editableTargetRef.current = target;
       setMenuClosing(false);
       setMenu({ x, y, hasSelection: selection.length > 0, type: "edit" });
     }
@@ -109,6 +117,7 @@ export function ContextMenuProvider({ children }: { children: React.ReactNode })
   }, []);
 
   const runCommand = (command: string) => {
+    editableTargetRef.current?.focus();
     document.execCommand(command);
     dismissMenu();
   };
