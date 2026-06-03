@@ -13,13 +13,7 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import type { Components } from "react-markdown";
 import "katex/dist/katex.min.css";
 
-function CodeBlock({
-  children,
-  language,
-}: {
-  children: React.ReactNode;
-  language?: string;
-}) {
+function CodeBlock({ children, language }: { children: React.ReactNode; language?: string }) {
   const { t } = useTranslation();
   const [copied, setCopied] = useState(false);
 
@@ -158,9 +152,7 @@ const components: Components = {
       typeof children === "object" &&
       "props" in (children as React.ReactElement)
     ) {
-      const codeProps = (
-        children as React.ReactElement<{ className?: string }>
-      ).props;
+      const codeProps = (children as React.ReactElement<{ className?: string }>).props;
       const match = codeProps.className?.match(/language-(\S+)/);
       if (match) language = match[1];
     }
