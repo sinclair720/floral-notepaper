@@ -219,11 +219,11 @@ fn default_base_dir() -> Result<PathBuf, AppError> {
 
     #[cfg(target_os = "macos")]
     if let Some(dir) = dirs::data_dir() {
-        return Ok(dir.join(".floral"));
+        return Ok(dir.join("花笺"));
     }
 
     if let Some(dir) = dirs::document_dir() {
-        return Ok(dir.join(".floral"));
+        return Ok(dir.join("花笺"));
     }
 
     Ok(env::current_dir()?.join("data"))
@@ -240,13 +240,7 @@ fn known_data_migration_candidates_for(
     let mut candidates = Vec::new();
     if let Some(home) = home {
         let home = PathBuf::from(home);
-        candidates.push(home.join("Documents").join(".floral"));
         candidates.push(home.join("Documents").join("花笺"));
-        candidates.push(
-            home.join("Library")
-                .join("Application Support")
-                .join(".floral"),
-        );
         candidates.push(
             home.join("Library")
                 .join("Application Support")
@@ -255,7 +249,6 @@ fn known_data_migration_candidates_for(
     }
     if let Some(profile) = userprofile {
         let profile = PathBuf::from(profile);
-        candidates.push(profile.join("Documents").join(".floral"));
         candidates.push(profile.join("Documents").join("花笺"));
     }
 
