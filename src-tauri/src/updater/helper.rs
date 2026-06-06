@@ -713,9 +713,7 @@ fn disk_space_requirements(
         let Some(install_dir) = command.target_path.parent() else {
             return Ok(requirements);
         };
-        let Some(backup_parent) = command.ready_path.parent() else {
-            return Err(UpdateHelperExitCode::ReplacementFailed);
-        };
+        let backup_parent = windows_rollback_storage_parent(command, install_dir)?;
         let backup_bytes = directory_size_bytes(install_dir).map_err(|error| {
             let code = map_copy_error_code(&error, UpdateHelperExitCode::ReplacementFailed);
             let _ = write_log_line(
@@ -728,7 +726,7 @@ fn disk_space_requirements(
             code
         })?;
         requirements.push(DiskSpaceRequirement {
-            probe_path: existing_probe_path(backup_parent),
+            probe_path: existing_probe_path(&backup_parent),
             required_bytes: backup_bytes,
             reason: "Windows rollback backup",
         });
@@ -960,12 +958,32 @@ fn prepare_windows_rollback_plan(
         .parent()
         .ok_or(UpdateHelperExitCode::ReplacementFailed)?
         .to_path_buf();
-    let backup_parent = command
-        .ready_path
-        .parent()
-        .ok_or(UpdateHelperExitCode::ReplacementFailed)?;
-    let registry_backup = backup_windows_registry_state(command, backup_parent, log)?;
-    let backup_dir = unique_temp_path(backup_parent, "windows-rollback", Some("dir"));
+    let backup_parent = windows_rollback_storage_parent(command, &install_dir)?;
+    if let Some(ready_parent) = command.ready_path.parent() {
+        if backup_parent != ready_parent {
+            write_log_line(
+                log,
+                &format!(
+                    "Windows rollback storage moved outside install directory: {} -> {}",
+                    ready_parent.display(),
+                    backup_parent.display()
+                ),
+            )?;
+        }
+    }
+    fs::create_dir_all(&backup_parent).map_err(|error| {
+        let code = map_copy_error_code(&error, UpdateHelperExitCode::ReplacementFailed);
+        let _ = write_log_line(
+            log,
+            &format!(
+                "failed to create Windows rollback storage parent {} ({error})",
+                backup_parent.display()
+            ),
+        );
+        code
+    })?;
+    let registry_backup = backup_windows_registry_state(command, &backup_parent, log)?;
+    let backup_dir = unique_temp_path(&backup_parent, "windows-rollback", Some("dir"));
     fs::create_dir_all(&backup_dir).map_err(|error| {
         let code = map_copy_error_code(&error, UpdateHelperExitCode::ReplacementFailed);
         let _ = write_log_line(
@@ -2628,6 +2646,9 @@ fn copy_dir_recursive(from: &Path, to: &Path) -> Result<(), std::io::Error> {
     for entry in fs::read_dir(from)? {
         let entry = entry?;
         let source = entry.path();
+        if source == to || source.starts_with(to) {
+            continue;
+        }
         let target = to.join(entry.file_name());
         if entry.file_type()?.is_dir() {
             copy_dir_recursive(&source, &target)?;
@@ -2650,6 +2671,21 @@ fn directory_size_bytes(path: &Path) -> Result<u64, std::io::Error> {
         total = total.saturating_add(directory_size_bytes(&entry.path())?);
     }
     Ok(total)
+}
+
+fn windows_rollback_storage_parent(
+    command: &UpdateHelperCommand,
+    install_dir: &Path,
+) -> Result<PathBuf, UpdateHelperExitCode> {
+    let backup_parent = command
+        .ready_path
+        .parent()
+        .ok_or(UpdateHelperExitCode::ReplacementFailed)?;
+    if !backup_parent.starts_with(install_dir) {
+        return Ok(backup_parent.to_path_buf());
+    }
+
+    Ok(std::env::temp_dir().join("floral-notepaper-update-rollback"))
 }
 
 fn existing_probe_path(path: &Path) -> PathBuf {
@@ -3756,6 +3792,27 @@ mod tests {
         assert_eq!(requirement.required_bytes, 34);
         assert!(requirement.reasons.contains(&"installer workspace"));
         assert!(requirement.reasons.contains(&"Windows rollback backup"));
+    }
+
+    #[test]
+    fn windows_rollback_storage_parent_moves_out_of_install_dir() {
+        let root = temp_dir("helper-windows-rollback-parent");
+        let install_dir = root.join("install");
+        let staging_dir = install_dir.join("staging");
+        fs::create_dir_all(&staging_dir).expect("create staging dir");
+        let mut command = helper_command(&root);
+        command.install_kind = InstallKind::WindowsNsis;
+        command.target_path = install_dir.join("floral-notepaper.exe");
+        command.ready_path = staging_dir.join("helper.ready");
+
+        let backup_parent =
+            windows_rollback_storage_parent(&command, &install_dir).expect("resolve backup dir");
+
+        assert!(!backup_parent.starts_with(&install_dir));
+        assert!(
+            backup_parent.ends_with("floral-notepaper-update-rollback"),
+            "fallback should use shared system temp rollback root"
+        );
     }
 
     #[test]
