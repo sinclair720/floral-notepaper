@@ -6,7 +6,7 @@ pub mod updater;
 
 use locales::Locale;
 use services::notes::{default_store, AppConfig, AppError, Note, NoteMetadata, SaveNoteRequest};
-use std::{fs, path::PathBuf};
+use std::{env, fs, io::Write, path::PathBuf};
 use tauri::{AppHandle, Emitter, Manager};
 
 #[tauri::command]
@@ -314,9 +314,73 @@ fn take_startup_file() -> Option<String> {
     desktop::take_startup_file()
 }
 
+fn cli_version_or_help_requested() -> bool {
+    env::args().any(|arg| matches!(arg.as_str(), "--version" | "-V" | "--help" | "-h"))
+}
+
+#[cfg(windows)]
+fn ensure_console() {
+    use windows_sys::Win32::System::Console::{AllocConsole, AttachConsole, ATTACH_PARENT_PROCESS};
+
+    unsafe {
+        if AttachConsole(ATTACH_PARENT_PROCESS) == 0 {
+            let _ = AllocConsole();
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn ensure_console() {}
+
+fn flush_attached_console_stdout() {
+    let _ = std::io::stdout().flush();
+}
+
+fn print_cli_version() {
+    let _ = writeln!(
+        std::io::stdout(),
+        "floral-notepaper {}",
+        env!("CARGO_PKG_VERSION")
+    );
+    flush_attached_console_stdout();
+}
+
+fn print_cli_help() {
+    let _ = writeln!(
+        std::io::stdout(),
+        "floral-notepaper {}\nFloral Notepaper - lightweight local note app\n\nUSAGE:\n    floral-notepaper [OPTIONS]\n\nOPTIONS:\n    -V, --version\n            Print version\n    -h, --help\n            Print help",
+        env!("CARGO_PKG_VERSION"),
+    );
+    flush_attached_console_stdout();
+}
+
+pub fn try_exit_for_cli_version_or_help() {
+    if !cli_version_or_help_requested() {
+        return;
+    }
+
+    ensure_console();
+
+    let wants_version = env::args().any(|arg| arg == "--version" || arg == "-V");
+    let wants_help = env::args().any(|arg| arg == "--help" || arg == "-h");
+
+    if wants_version {
+        print_cli_version();
+        std::process::exit(0);
+    }
+
+    if wants_help {
+        print_cli_help();
+        std::process::exit(0);
+    }
+
+    std::process::exit(0);
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_cli::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_opener::init())

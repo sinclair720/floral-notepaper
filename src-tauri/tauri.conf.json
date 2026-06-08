@@ -74,5 +74,11 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ]
+  },
+  "plugins": {
+    "cli": {
+      "description": "Floral Notepaper - lightweight local note app",
+      "args": []
+    }
   }
 }
