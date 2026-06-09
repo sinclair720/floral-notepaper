@@ -1,8 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useHotkeyRecorder } from "@tanstack/react-hotkeys";
 import { useTranslation } from "react-i18next";
 import { checkGlobalShortcut, chooseBackgroundImage } from "../features/settings/api";
+import { UpdateSettingsSection } from "../features/update/UpdateSettingsSection";
 import type {
   AppConfig,
   BackgroundFit,
@@ -16,9 +16,10 @@ import {
   isValidGlobalShortcut,
   shortcutPlatform,
 } from "../features/settings/shortcutRecorder";
+import { useShortcutRecorder } from "../features/settings/useShortcutRecorder";
 import { DEFAULT_TILE_COLOR, normalizeTileColor } from "../features/settings/tileColor";
 import { applyTheme, watchSystemTheme } from "../features/settings/theme";
-import { SUPPORTED_LOCALES } from "../locales/locale-whitelist";
+import { LOCALE_OPTIONS } from "../locales/locale-whitelist";
 import { SlidingButtonGroup } from "./SlidingButtonGroup";
 
 const HARMONY_FONT_LICENSE_URL = new URL("../assets/fonts/LICENSE_Fonts", import.meta.url).href;
@@ -80,14 +81,9 @@ export function SettingsPanel({ config, onChange, onChooseNotesDir, onClose }: S
   );
   const localeOptions = useMemo(
     () =>
-      SUPPORTED_LOCALES.map((locale) => ({
-        value: locale,
-        label:
-          locale === "zh-CN"
-            ? t("settings.locale.zhCN", { defaultValue: "简体中文" })
-            : locale === "en-US"
-              ? t("settings.locale.enUS", { defaultValue: "English" })
-              : t("settings.locale.zhHK", { defaultValue: "繁體中文" }),
+      LOCALE_OPTIONS.map(({ value, labelKey, defaultLabel }) => ({
+        value,
+        label: t(labelKey, { defaultValue: defaultLabel }),
       })),
     [t],
   );
@@ -446,6 +442,8 @@ export function SettingsPanel({ config, onChange, onChooseNotesDir, onClose }: S
           />
         </section>
 
+        <UpdateSettingsSection mode="settingsOnly" />
+
         <section className="pt-2 border-t border-paper-deep/25">
           <p className="text-[10px] leading-relaxed text-ink-ghost/75">
             <span>
@@ -539,7 +537,6 @@ type ShortcutMsg = { key: string; params?: Record<string, string> } | { raw: str
 
 function ShortcutRecorder({ value, onChange }: ShortcutRecorderProps) {
   const { t } = useTranslation();
-  const [heldKeys, setHeldKeys] = useState<string[]>([]);
   const [checkState, setCheckState] = useState<"idle" | "checking" | "ok" | "warning" | "error">(
     "idle",
   );
@@ -569,7 +566,19 @@ function ShortcutRecorder({ value, onChange }: ShortcutRecorderProps) {
     shortcutCheckRequestId.current += 1;
   };
 
+  const markShortcutCleared = () => {
+    invalidateShortcutChecks();
+    setCheckState("idle");
+    setCheckMsg({ key: "settings.shortcut.cleared" });
+  };
+
   const runShortcutCheck = async (shortcut: string, saveWhenAvailable: boolean) => {
+    // 未设置是合法状态，不需要调用后端做冲突检测。
+    if (!shortcut) {
+      markShortcutCleared();
+      return;
+    }
+
     const requestId = shortcutCheckRequestId.current + 1;
     shortcutCheckRequestId.current = requestId;
     setCheckState("checking");
@@ -600,16 +609,14 @@ function ShortcutRecorder({ value, onChange }: ShortcutRecorderProps) {
     }
   };
 
-  const recorder = useHotkeyRecorder({
-    onRecord: (hotkey) => {
-      if (String(hotkey) === "") {
-        invalidateShortcutChecks();
+  const recorder = useShortcutRecorder({
+    onRecord: (shortcut) => {
+      if (shortcut === "") {
         onChange("");
-        setCheckState("idle");
-        setCheckMsg({ key: "settings.shortcut.cleared" });
-      } else if (isValidGlobalShortcut(hotkey)) {
-        const nextShortcut = hotkeyToConfigString(hotkey, platform);
-        void runShortcutCheck(nextShortcut, true);
+        markShortcutCleared();
+      } else if (isValidGlobalShortcut(shortcut)) {
+        const configString = hotkeyToConfigString(shortcut, platform);
+        void runShortcutCheck(configString, true);
       } else {
         invalidateShortcutChecks();
         setCheckState("warning");
@@ -619,44 +626,12 @@ function ShortcutRecorder({ value, onChange }: ShortcutRecorderProps) {
   });
   const containerRef = useRef<HTMLDivElement>(null);
 
-  useEffect(() => {
-    if (!recorder.isRecording) {
-      setHeldKeys([]);
-      return;
-    }
-
-    const pressed = new Set<string>();
-
-    const toLabel = (e: KeyboardEvent): string => {
-      if (e.key === "Control") return "Control";
-      if (e.key === "Alt") return "Alt";
-      if (e.key === "Shift") return "Shift";
-      if (e.key === "Meta") return "Meta";
-      return e.key.length === 1 ? e.key.toUpperCase() : e.key;
-    };
-
-    const onKeyDown = (e: KeyboardEvent) => {
-      pressed.add(toLabel(e));
-      setHeldKeys([...pressed]);
-    };
-    const onKeyUp = (e: KeyboardEvent) => {
-      pressed.delete(toLabel(e));
-      setHeldKeys([...pressed]);
-    };
-    const onBlur = () => {
-      pressed.clear();
-      setHeldKeys([]);
-    };
-
-    document.addEventListener("keydown", onKeyDown, true);
-    document.addEventListener("keyup", onKeyUp, true);
-    window.addEventListener("blur", onBlur);
-    return () => {
-      document.removeEventListener("keydown", onKeyDown, true);
-      document.removeEventListener("keyup", onKeyUp, true);
-      window.removeEventListener("blur", onBlur);
-    };
-  }, [recorder.isRecording]);
+  const clearShortcut = () => {
+    // 显式清除会保存为空值，后端据此注销旧的全局快捷键绑定。
+    recorder.cancelRecording();
+    onChange("");
+    markShortcutCleared();
+  };
 
   useEffect(() => {
     if (!recorder.isRecording) return;
@@ -670,7 +645,9 @@ function ShortcutRecorder({ value, onChange }: ShortcutRecorderProps) {
   }, [recorder.isRecording, recorder.cancelRecording]);
 
   const liveDisplay =
-    recorder.isRecording && heldKeys.length > 0 ? formatHeldKeys(heldKeys, platform) : null;
+    recorder.isRecording && recorder.heldKeys.length > 0
+      ? formatHeldKeys(recorder.heldKeys, platform)
+      : null;
   const statusClass =
     checkState === "ok"
       ? "text-bamboo"
@@ -720,7 +697,17 @@ function ShortcutRecorder({ value, onChange }: ShortcutRecorderProps) {
         </button>
         <button
           type="button"
-          disabled={isChecking || recorder.isRecording}
+          disabled={!value || recorder.isRecording}
+          onClick={clearShortcut}
+          aria-label={t("settings.shortcut.clear", { defaultValue: "清除" })}
+          title={t("settings.shortcut.clear", { defaultValue: "清除" })}
+          className="w-8 h-8 rounded-lg border border-paper-deep/45 text-[15px] leading-none text-ink-faint hover:text-red-400 hover:bg-paper-warm/70 disabled:opacity-50 disabled:cursor-not-allowed transition-colors cursor-pointer"
+        >
+          ×
+        </button>
+        <button
+          type="button"
+          disabled={!value || isChecking || recorder.isRecording}
           onClick={() => void runShortcutCheck(value, false)}
           className="h-8 px-3 rounded-lg border border-paper-deep/45 text-[11px] text-ink-faint hover:text-bamboo hover:bg-bamboo-mist/50 disabled:opacity-50 disabled:cursor-not-allowed transition-colors cursor-pointer"
         >

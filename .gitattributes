@@ -1,3 +1,2 @@
-# Cargo 工具链始终输出 LF，锁定行尾避免 autocrlf 误报
-Cargo.toml text eol=lf
-Cargo.lock text eol=lf
+# 统一行尾为 LF，避免 Windows autocrlf 导致格式检查失败
+* text=auto eol=lf

@@ -10,6 +10,393 @@ use std::{
         Mutex,
     },
 };
+
+#[cfg(target_os = "windows")]
+mod keyboard_hook {
+    use serde::Serialize;
+    use std::sync::{
+        atomic::{AtomicIsize, AtomicU32, AtomicU8, Ordering},
+        Mutex,
+    };
+    use tauri::{AppHandle, Emitter};
+
+    const WH_KEYBOARD_LL: i32 = 13;
+    const WM_KEYDOWN: u32 = 0x0100;
+    const WM_KEYUP: u32 = 0x0101;
+    const WM_SYSKEYDOWN: u32 = 0x0104;
+    const WM_SYSKEYUP: u32 = 0x0105;
+    const WM_QUIT: u32 = 0x0012;
+    const WM_HOOK_KEY: u32 = 0x0400 + 1;
+
+    const MOD_CTRL: u8 = 1;
+    const MOD_ALT: u8 = 2;
+    const MOD_SHIFT: u8 = 4;
+    const MOD_META: u8 = 8;
+
+    #[repr(C)]
+    #[allow(clippy::upper_case_acronyms)]
+    struct KBDLLHOOKSTRUCT {
+        vk_code: u32,
+        scan_code: u32,
+        flags: u32,
+        time: u32,
+        dw_extra_info: usize,
+    }
+
+    #[repr(C)]
+    #[allow(clippy::upper_case_acronyms)]
+    struct MSG {
+        hwnd: isize,
+        message: u32,
+        w_param: usize,
+        l_param: isize,
+        time: u32,
+        pt_x: i32,
+        pt_y: i32,
+    }
+
+    #[allow(clippy::upper_case_acronyms)]
+    type HOOKPROC = extern "system" fn(i32, usize, isize) -> isize;
+
+    extern "system" {
+        fn SetWindowsHookExW(id_hook: i32, lpfn: HOOKPROC, hmod: isize, dw_thread_id: u32)
+            -> isize;
+        fn UnhookWindowsHookEx(hhk: isize) -> i32;
+        fn CallNextHookEx(hhk: isize, n_code: i32, w_param: usize, l_param: isize) -> isize;
+        fn GetMessageW(
+            lp_msg: *mut MSG,
+            hwnd: isize,
+            msg_filter_min: u32,
+            msg_filter_max: u32,
+        ) -> i32;
+        fn PostThreadMessageW(id_thread: u32, msg: u32, w_param: usize, l_param: isize) -> i32;
+        fn GetCurrentThreadId() -> u32;
+        fn GetModuleHandleW(lp_module_name: *const u16) -> isize;
+    }
+
+    #[link(name = "imm32")]
+    extern "system" {
+        fn ImmGetHotKey(
+            dw_hot_key_id: u32,
+            lpu_modifiers: *mut u32,
+            lpu_vkey: *mut u32,
+            phkl: *mut isize,
+        ) -> i32;
+        fn ImmSetHotKey(dw_hot_key_id: u32, u_modifiers: u32, u_vkey: u32, hkl: isize) -> i32;
+    }
+
+    static HOOK_HANDLE: AtomicIsize = AtomicIsize::new(0);
+    static HOOK_THREAD_ID: AtomicU32 = AtomicU32::new(0);
+    static HOOK_MODS: AtomicU8 = AtomicU8::new(0);
+    static HOOK_APP: Mutex<Option<AppHandle>> = Mutex::new(None);
+    static HOOK_THREAD: Mutex<Option<std::thread::JoinHandle<()>>> = Mutex::new(None);
+    static SAVED_IME_HOTKEYS: Mutex<Vec<(u32, u32, u32, isize)>> = Mutex::new(Vec::new());
+
+    #[derive(Debug, Clone, Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct HookKeyEvent {
+        key: String,
+        ctrl: bool,
+        alt: bool,
+        shift: bool,
+        meta: bool,
+    }
+
+    fn is_modifier_vk(vk: u32) -> bool {
+        matches!(
+            vk,
+            0x10 | 0x11 | 0x12 | 0xA0 | 0xA1 | 0xA2 | 0xA3 | 0xA4 | 0xA5 | 0x5B | 0x5C
+        )
+    }
+
+    fn update_modifier_state(vk: u32, pressed: bool) {
+        let bit = match vk {
+            0x10 | 0xA0 | 0xA1 => MOD_SHIFT,
+            0x11 | 0xA2 | 0xA3 => MOD_CTRL,
+            0x12 | 0xA4 | 0xA5 => MOD_ALT,
+            0x5B | 0x5C => MOD_META,
+            _ => return,
+        };
+        if pressed {
+            HOOK_MODS.fetch_or(bit, Ordering::SeqCst);
+        } else {
+            HOOK_MODS.fetch_and(!bit, Ordering::SeqCst);
+        }
+    }
+
+    fn vk_to_key_name(vk: u32) -> Option<&'static str> {
+        Some(match vk {
+            0x41 => "A",
+            0x42 => "B",
+            0x43 => "C",
+            0x44 => "D",
+            0x45 => "E",
+            0x46 => "F",
+            0x47 => "G",
+            0x48 => "H",
+            0x49 => "I",
+            0x4A => "J",
+            0x4B => "K",
+            0x4C => "L",
+            0x4D => "M",
+            0x4E => "N",
+            0x4F => "O",
+            0x50 => "P",
+            0x51 => "Q",
+            0x52 => "R",
+            0x53 => "S",
+            0x54 => "T",
+            0x55 => "U",
+            0x56 => "V",
+            0x57 => "W",
+            0x58 => "X",
+            0x59 => "Y",
+            0x5A => "Z",
+            0x30 => "0",
+            0x31 => "1",
+            0x32 => "2",
+            0x33 => "3",
+            0x34 => "4",
+            0x35 => "5",
+            0x36 => "6",
+            0x37 => "7",
+            0x38 => "8",
+            0x39 => "9",
+            0x70 => "F1",
+            0x71 => "F2",
+            0x72 => "F3",
+            0x73 => "F4",
+            0x74 => "F5",
+            0x75 => "F6",
+            0x76 => "F7",
+            0x77 => "F8",
+            0x78 => "F9",
+            0x79 => "F10",
+            0x7A => "F11",
+            0x7B => "F12",
+            0x20 => "Space",
+            0x09 => "Tab",
+            0x0D => "Enter",
+            0x08 => "Backspace",
+            0x2E => "Delete",
+            0x1B => "Escape",
+            0x26 => "ArrowUp",
+            0x28 => "ArrowDown",
+            0x25 => "ArrowLeft",
+            0x27 => "ArrowRight",
+            0x24 => "Home",
+            0x23 => "End",
+            0x21 => "PageUp",
+            0x22 => "PageDown",
+            0x2D => "Insert",
+            0x60 => "Numpad0",
+            0x61 => "Numpad1",
+            0x62 => "Numpad2",
+            0x63 => "Numpad3",
+            0x64 => "Numpad4",
+            0x65 => "Numpad5",
+            0x66 => "Numpad6",
+            0x67 => "Numpad7",
+            0x68 => "Numpad8",
+            0x69 => "Numpad9",
+            0x6A => "NumpadMultiply",
+            0x6B => "NumpadAdd",
+            0x6D => "NumpadSubtract",
+            0x6E => "NumpadDecimal",
+            0x6F => "NumpadDivide",
+            0xBA => ";",
+            0xBB => "=",
+            0xBC => ",",
+            0xBD => "-",
+            0xBE => ".",
+            0xBF => "/",
+            0xC0 => "`",
+            0xDB => "[",
+            0xDC => "\\",
+            0xDD => "]",
+            0xDE => "'",
+            _ => return None,
+        })
+    }
+
+    // hook_proc must return ASAP to avoid Windows removing the hook (200ms timeout).
+    // We only do atomic reads + PostThreadMessageW here; Tauri event emission
+    // happens in the message-pump thread which has no timeout constraint.
+    extern "system" fn hook_proc(n_code: i32, w_param: usize, l_param: isize) -> isize {
+        if n_code >= 0 {
+            let kb = unsafe { &*(l_param as *const KBDLLHOOKSTRUCT) };
+            let vk = kb.vk_code;
+
+            match w_param as u32 {
+                WM_KEYDOWN | WM_SYSKEYDOWN => {
+                    if is_modifier_vk(vk) {
+                        update_modifier_state(vk, true);
+                    } else {
+                        let mods = HOOK_MODS.load(Ordering::SeqCst);
+                        let tid = HOOK_THREAD_ID.load(Ordering::SeqCst);
+                        if tid != 0 {
+                            unsafe {
+                                PostThreadMessageW(
+                                    tid,
+                                    WM_HOOK_KEY,
+                                    (vk as usize) | ((mods as usize) << 16),
+                                    0,
+                                );
+                            }
+                        }
+                        return 1;
+                    }
+                }
+                WM_KEYUP | WM_SYSKEYUP => {
+                    if is_modifier_vk(vk) {
+                        update_modifier_state(vk, false);
+                    } else {
+                        return 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        unsafe { CallNextHookEx(HOOK_HANDLE.load(Ordering::SeqCst), n_code, w_param, l_param) }
+    }
+
+    fn emit_from_message(w_param: usize) {
+        let vk = (w_param & 0xFFFF) as u32;
+        let mods = ((w_param >> 16) & 0xFF) as u8;
+        if let Some(key_name) = vk_to_key_name(vk) {
+            let event = HookKeyEvent {
+                key: key_name.to_string(),
+                ctrl: mods & MOD_CTRL != 0,
+                alt: mods & MOD_ALT != 0,
+                shift: mods & MOD_SHIFT != 0,
+                meta: mods & MOD_META != 0,
+            };
+            if let Ok(guard) = HOOK_APP.lock() {
+                if let Some(app) = guard.as_ref() {
+                    let _ = app.emit("shortcut-hook-key", &event);
+                }
+            }
+        }
+    }
+
+    const IME_HOTKEY_IDS: &[u32] = &[
+        0x10, // IME_CHOTKEY_IME_NONIME_TOGGLE  (Ctrl+Space)
+        0x11, // IME_CHOTKEY_SHAPE_TOGGLE        (Shift+Space)
+        0x12, // IME_CHOTKEY_SYMBOL_TOGGLE       (Ctrl+.)
+        0x30, // IME_JHOTKEY_CLOSE_OPEN
+        0x50, // IME_KHOTKEY_SHAPE_TOGGLE
+        0x51, // IME_KHOTKEY_HANJACONVERT
+        0x52, // IME_KHOTKEY_ENGLISH
+        0x70, // IME_THOTKEY_IME_NONIME_TOGGLE
+        0x71, // IME_THOTKEY_SHAPE_TOGGLE
+        0x72, // IME_THOTKEY_SYMBOL_TOGGLE
+    ];
+
+    fn disable_ime_hotkeys() {
+        let mut saved = Vec::new();
+        for &id in IME_HOTKEY_IDS {
+            let mut modifiers = 0u32;
+            let mut vkey = 0u32;
+            let mut hkl: isize = 0;
+            if unsafe { ImmGetHotKey(id, &mut modifiers, &mut vkey, &mut hkl) } != 0 {
+                saved.push((id, modifiers, vkey, hkl));
+                unsafe {
+                    ImmSetHotKey(id, 0, 0, 0);
+                }
+            }
+        }
+        if let Ok(mut guard) = SAVED_IME_HOTKEYS.lock() {
+            *guard = saved;
+        }
+    }
+
+    fn restore_ime_hotkeys() {
+        if let Ok(mut guard) = SAVED_IME_HOTKEYS.lock() {
+            for &(id, modifiers, vkey, hkl) in guard.iter() {
+                unsafe {
+                    ImmSetHotKey(id, modifiers, vkey, hkl);
+                }
+            }
+            guard.clear();
+        }
+    }
+
+    pub fn start(app: AppHandle) {
+        stop();
+        disable_ime_hotkeys();
+
+        if let Ok(mut guard) = HOOK_APP.lock() {
+            *guard = Some(app);
+        }
+        HOOK_MODS.store(0, Ordering::SeqCst);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        let handle = std::thread::spawn(move || {
+            let thread_id = unsafe { GetCurrentThreadId() };
+            let hmod = unsafe { GetModuleHandleW(std::ptr::null()) };
+            let hook = unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, hook_proc, hmod, 0) };
+
+            if hook == 0 {
+                eprintln!("[keyboard_hook] SetWindowsHookExW failed");
+                let _ = tx.send(false);
+                return;
+            }
+
+            HOOK_HANDLE.store(hook, Ordering::SeqCst);
+            HOOK_THREAD_ID.store(thread_id, Ordering::SeqCst);
+            let _ = tx.send(true);
+
+            let mut msg: MSG = unsafe { std::mem::zeroed() };
+            loop {
+                let ret = unsafe { GetMessageW(&mut msg, 0, 0, 0) };
+                if ret <= 0 {
+                    break;
+                }
+                if msg.message == WM_HOOK_KEY {
+                    emit_from_message(msg.w_param);
+                }
+            }
+
+            unsafe {
+                UnhookWindowsHookEx(hook);
+            }
+            HOOK_HANDLE.store(0, Ordering::SeqCst);
+            HOOK_THREAD_ID.store(0, Ordering::SeqCst);
+        });
+
+        match rx.recv() {
+            Ok(true) => {}
+            _ => eprintln!("[keyboard_hook] hook thread failed to start"),
+        }
+
+        if let Ok(mut guard) = HOOK_THREAD.lock() {
+            *guard = Some(handle);
+        }
+    }
+
+    pub fn stop() {
+        let thread_id = HOOK_THREAD_ID.swap(0, Ordering::SeqCst);
+        if thread_id != 0 {
+            unsafe {
+                PostThreadMessageW(thread_id, WM_QUIT, 0, 0);
+            }
+        }
+
+        if let Ok(mut guard) = HOOK_THREAD.lock() {
+            if let Some(handle) = guard.take() {
+                let _ = handle.join();
+            }
+        }
+
+        if let Ok(mut guard) = HOOK_APP.lock() {
+            *guard = None;
+        }
+        HOOK_MODS.store(0, Ordering::SeqCst);
+        restore_ime_hotkeys();
+    }
+}
 use tauri::{
     menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
@@ -18,12 +405,17 @@ use tauri::{
 };
 use uuid::Uuid;
 
+#[cfg(target_os = "macos")]
+use tauri::menu::Submenu;
+
 #[cfg(desktop)]
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt as AutostartExt};
 #[cfg(desktop)]
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 
 const MAIN_WINDOW_LABEL: &str = "main";
+const OPEN_ABOUT_PANEL_EVENT: &str = "open-about-panel";
+const MACOS_APP_ABOUT_ID: &str = "macos-about";
 const TRAY_ID: &str = "main-tray";
 const TRAY_SHOW_MAIN_ID: &str = "show-main";
 const TRAY_QUICK_NOTE_ID: &str = "quick-note";
@@ -51,6 +443,11 @@ pub enum TrayMenuAction {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppMenuAction {
+    ShowAboutPanel,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TrayMenuSpec {
     pub id: &'static str,
     pub label: &'static str,
@@ -62,6 +459,7 @@ pub enum ShortcutKey {
     Letter(char),
     Digit(u8),
     Function(u8),
+    Punctuation(char),
     Space,
     Tab,
     Enter,
@@ -280,6 +678,13 @@ pub fn tray_menu_action(id: &str) -> Option<TrayMenuAction> {
     }
 }
 
+fn app_menu_action(id: &str) -> Option<AppMenuAction> {
+    match id {
+        MACOS_APP_ABOUT_ID => Some(AppMenuAction::ShowAboutPanel),
+        _ => None,
+    }
+}
+
 pub fn tray_menu_specs(locale: Locale, close_to_tray: bool, autostart: bool) -> Vec<TrayMenuSpec> {
     vec![
         TrayMenuSpec {
@@ -359,6 +764,118 @@ fn build_tray_menu(app: &AppHandle, config: &AppConfig) -> Result<Menu<Wry>, Box
     )?)
 }
 
+#[cfg(target_os = "macos")]
+fn build_app_menu(app: &AppHandle, config: &AppConfig) -> Result<Menu<Wry>, Box<dyn Error>> {
+    let locale = locale_from_config(config);
+
+    let about = MenuItem::with_id(
+        app,
+        MACOS_APP_ABOUT_ID,
+        locales::macos_menu_about_label(locale),
+        true,
+        None::<&str>,
+    )?;
+    let services =
+        PredefinedMenuItem::services(app, Some(locales::macos_menu_services_label(locale)))?;
+    let hide = PredefinedMenuItem::hide(app, Some(&locales::macos_menu_hide_app_label(locale)))?;
+    let hide_others =
+        PredefinedMenuItem::hide_others(app, Some(locales::macos_menu_hide_others_label(locale)))?;
+    let quit = PredefinedMenuItem::quit(app, Some(&locales::macos_menu_quit_app_label(locale)))?;
+    let file_close_window = PredefinedMenuItem::close_window(
+        app,
+        Some(locales::macos_menu_close_window_label(locale)),
+    )?;
+    let window_close_window = PredefinedMenuItem::close_window(
+        app,
+        Some(locales::macos_menu_close_window_label(locale)),
+    )?;
+    let undo = PredefinedMenuItem::undo(app, Some(locales::macos_menu_undo_label(locale)))?;
+    let redo = PredefinedMenuItem::redo(app, Some(locales::macos_menu_redo_label(locale)))?;
+    let cut = PredefinedMenuItem::cut(app, Some(locales::macos_menu_cut_label(locale)))?;
+    let copy = PredefinedMenuItem::copy(app, Some(locales::macos_menu_copy_label(locale)))?;
+    let paste = PredefinedMenuItem::paste(app, Some(locales::macos_menu_paste_label(locale)))?;
+    let select_all =
+        PredefinedMenuItem::select_all(app, Some(locales::macos_menu_select_all_label(locale)))?;
+    let fullscreen =
+        PredefinedMenuItem::fullscreen(app, Some(locales::macos_menu_fullscreen_label(locale)))?;
+    let minimize =
+        PredefinedMenuItem::minimize(app, Some(locales::macos_menu_minimize_label(locale)))?;
+    let zoom = PredefinedMenuItem::maximize(app, Some(locales::macos_menu_zoom_label(locale)))?;
+    let separator = PredefinedMenuItem::separator(app)?;
+
+    let app_menu = Submenu::with_items(
+        app,
+        locales::app_name(locale),
+        true,
+        &[
+            &about,
+            &PredefinedMenuItem::separator(app)?,
+            &services,
+            &PredefinedMenuItem::separator(app)?,
+            &hide,
+            &hide_others,
+            &PredefinedMenuItem::separator(app)?,
+            &quit,
+        ],
+    )?;
+    let file_menu = Submenu::with_items(
+        app,
+        locales::macos_menu_file_label(locale),
+        true,
+        &[&file_close_window],
+    )?;
+    let edit_menu = Submenu::with_items(
+        app,
+        locales::macos_menu_edit_label(locale),
+        true,
+        &[&undo, &redo, &separator, &cut, &copy, &paste, &select_all],
+    )?;
+    let view_menu = Submenu::with_items(
+        app,
+        locales::macos_menu_view_label(locale),
+        true,
+        &[&fullscreen],
+    )?;
+    let window_menu = Submenu::with_items(
+        app,
+        locales::macos_menu_window_label(locale),
+        true,
+        &[
+            &minimize,
+            &zoom,
+            &PredefinedMenuItem::separator(app)?,
+            &window_close_window,
+        ],
+    )?;
+    let help_menu = Submenu::new(app, locales::macos_menu_help_label(locale), true)?;
+
+    let menu = Menu::with_items(
+        app,
+        &[
+            &app_menu,
+            &file_menu,
+            &edit_menu,
+            &view_menu,
+            &window_menu,
+            &help_menu,
+        ],
+    )?;
+
+    Ok(menu)
+}
+
+#[cfg(target_os = "macos")]
+fn refresh_app_menu(app: &AppHandle, config: &AppConfig) -> Result<(), Box<dyn Error>> {
+    let menu = build_app_menu(app, config)?;
+    let _ = app.set_menu(menu)?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn refresh_app_menu(_app: &AppHandle, _config: &AppConfig) -> Result<(), Box<dyn Error>> {
+    Ok(())
+}
+
 fn refresh_tray_menu(app: &AppHandle, config: &AppConfig) -> Result<(), Box<dyn Error>> {
     let Some(tray) = app.tray_by_id(TRAY_ID) else {
         return Ok(());
@@ -390,6 +907,7 @@ fn refresh_window_titles(app: &AppHandle, config: &AppConfig) -> Result<(), AppE
 
 pub fn refresh_shell_state(app: &AppHandle, config: &AppConfig) -> Result<(), Box<dyn Error>> {
     refresh_window_titles(app, config)?;
+    refresh_app_menu(app, config)?;
     refresh_tray_menu(app, config)?;
     Ok(())
 }
@@ -445,6 +963,9 @@ fn parse_shortcut_key(key: &str) -> Option<ShortcutKey> {
         }
         if c.is_ascii_digit() {
             return Some(ShortcutKey::Digit(c.to_digit(10)? as u8));
+        }
+        if c.is_ascii_punctuation() {
+            return Some(ShortcutKey::Punctuation(c));
         }
     }
 
@@ -598,10 +1119,16 @@ pub fn take_startup_file() -> Option<String> {
 pub fn setup_desktop(app: &mut App) -> Result<(), Box<dyn Error>> {
     app.manage(RuntimeState::default());
     app.manage(NotepadPool::default());
+    app.on_menu_event(|app, event| {
+        if let Err(error) = handle_app_menu_event(app, event.id.as_ref()) {
+            eprintln!("failed to handle app menu event {:?}: {error}", event.id);
+        }
+    });
     setup_autostart_plugin(app.handle())?;
     setup_global_shortcut_plugin(app.handle())?;
     sync_autostart_to_config(app.handle());
     register_configured_global_shortcut(app.handle());
+    setup_app_menu(app)?;
     setup_tray(app)?;
     schedule_notepad_prewarm(app.handle());
 
@@ -767,6 +1294,17 @@ fn setup_tray(app: &mut App) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
+fn setup_app_menu(app: &mut App) -> Result<(), Box<dyn Error>> {
+    let config = load_config()?;
+    refresh_app_menu(app.handle(), &config)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn setup_app_menu(_app: &mut App) -> Result<(), Box<dyn Error>> {
+    Ok(())
+}
+
 fn handle_tray_menu_event(app: &AppHandle, id: &str) -> Result<(), Box<dyn Error>> {
     match tray_menu_action(id) {
         Some(TrayMenuAction::ShowMain) => show_main_window(app)?,
@@ -792,6 +1330,31 @@ fn handle_tray_menu_event(app: &AppHandle, id: &str) -> Result<(), Box<dyn Error
             app.exit(0);
         }
         None => {}
+    }
+
+    Ok(())
+}
+
+fn handle_app_menu_event(app: &AppHandle, id: &str) -> Result<(), Box<dyn Error>> {
+    match app_menu_action(id) {
+        Some(AppMenuAction::ShowAboutPanel) => open_about_panel(app)?,
+        None => {}
+    }
+    Ok(())
+}
+
+fn open_about_panel(app: &AppHandle) -> Result<(), Box<dyn Error>> {
+    let had_window = app.get_webview_window(MAIN_WINDOW_LABEL).is_some();
+    show_main_window(app)?;
+
+    if had_window {
+        let _ = app.emit(OPEN_ABOUT_PANEL_EVENT, ());
+    } else {
+        let handle = app.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            let _ = handle.emit(OPEN_ABOUT_PANEL_EVENT, ());
+        });
     }
 
     Ok(())
@@ -1301,7 +1864,7 @@ fn app_is_exiting(app: &AppHandle) -> bool {
         .unwrap_or(false)
 }
 
-fn mark_app_exiting(app: &AppHandle) {
+pub(crate) fn mark_app_exiting(app: &AppHandle) {
     if let Some(state) = app.try_state::<RuntimeState>() {
         state.allow_exit();
     }
@@ -1518,7 +2081,15 @@ fn parse_configured_shortcut(field: &str, value: &str) -> Result<Shortcut, Box<d
 
 #[cfg(desktop)]
 fn shortcut_bindings_from_config(config: &AppConfig) -> Result<ShortcutBindings, Box<dyn Error>> {
-    let open_notepad = parse_configured_shortcut("globalShortcut", &config.global_shortcut)?;
+    // 允许用户主动清空快捷键；空值表示不注册对应的全局快捷键。
+    let open_notepad = if config.global_shortcut.is_empty() {
+        None
+    } else {
+        Some(parse_configured_shortcut(
+            "globalShortcut",
+            &config.global_shortcut,
+        )?)
+    };
     let toggle_visibility = if config.toggle_visibility_shortcut.is_empty() {
         None
     } else {
@@ -1528,9 +2099,11 @@ fn shortcut_bindings_from_config(config: &AppConfig) -> Result<ShortcutBindings,
         )?)
     };
 
-    if toggle_visibility
+    // 只有两个快捷键都已设置时才需要检查重复，避免清空快捷键时误报配置冲突。
+    if open_notepad
         .as_ref()
-        .is_some_and(|shortcut| shortcut == &open_notepad)
+        .zip(toggle_visibility.as_ref())
+        .is_some_and(|(open_notepad, toggle_visibility)| open_notepad == toggle_visibility)
     {
         return Err(Box::new(AppError {
             code: "duplicateShortcut".into(),
@@ -1540,7 +2113,7 @@ fn shortcut_bindings_from_config(config: &AppConfig) -> Result<ShortcutBindings,
     }
 
     Ok(ShortcutBindings {
-        open_notepad: Some(open_notepad),
+        open_notepad,
         toggle_visibility,
     })
 }
@@ -1669,6 +2242,20 @@ fn shortcut_key_to_code(key: ShortcutKey) -> Option<Code> {
             12 => Code::F12,
             _ => return None,
         },
+        ShortcutKey::Punctuation(c) => match c {
+            '[' => Code::BracketLeft,
+            ']' => Code::BracketRight,
+            ';' => Code::Semicolon,
+            '\'' => Code::Quote,
+            '`' => Code::Backquote,
+            ',' => Code::Comma,
+            '.' => Code::Period,
+            '/' => Code::Slash,
+            '\\' => Code::Backslash,
+            '-' => Code::Minus,
+            '=' => Code::Equal,
+            _ => return None,
+        },
         ShortcutKey::Space => Code::Space,
         ShortcutKey::Tab => Code::Tab,
         ShortcutKey::Enter => Code::Enter,
@@ -1736,6 +2323,39 @@ fn apply_autostart(_app: &AppHandle, _enabled: bool) -> Result<(), Box<dyn Error
     Ok(())
 }
 
+#[cfg(desktop)]
+pub fn start_shortcut_recording(app: &AppHandle) -> Result<(), Box<dyn Error>> {
+    app.global_shortcut().unregister_all()?;
+
+    #[cfg(target_os = "windows")]
+    keyboard_hook::start(app.clone());
+
+    Ok(())
+}
+
+#[cfg(desktop)]
+pub fn stop_shortcut_recording(app: &AppHandle) -> Result<(), Box<dyn Error>> {
+    #[cfg(target_os = "windows")]
+    keyboard_hook::stop();
+
+    let config = load_config()?;
+    if let Err(e) = install_global_shortcut_bindings(app, &config, false) {
+        eprintln!("failed to re-register global shortcuts after recording: {e}");
+    }
+
+    Ok(())
+}
+
+#[cfg(not(desktop))]
+pub fn start_shortcut_recording(_app: &AppHandle) -> Result<(), Box<dyn Error>> {
+    Ok(())
+}
+
+#[cfg(not(desktop))]
+pub fn stop_shortcut_recording(_app: &AppHandle) -> Result<(), Box<dyn Error>> {
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1760,6 +2380,15 @@ mod tests {
         );
         assert_eq!(tray_menu_action("quit"), Some(TrayMenuAction::Quit));
         assert_eq!(tray_menu_action("unknown"), None);
+    }
+
+    #[test]
+    fn maps_app_menu_ids_to_actions() {
+        assert_eq!(
+            app_menu_action("macos-about"),
+            Some(AppMenuAction::ShowAboutPanel)
+        );
+        assert_eq!(app_menu_action("unknown"), None);
     }
 
     #[test]
@@ -1874,12 +2503,11 @@ mod tests {
     }
 
     #[cfg(desktop)]
-    #[test]
-    fn rejects_duplicate_shortcut_bindings() {
-        let config = AppConfig {
+    fn test_app_config(global_shortcut: &str, toggle_visibility_shortcut: &str) -> AppConfig {
+        AppConfig {
             locale: "zh-CN".into(),
             notes_dir: "D:\\notes".into(),
-            global_shortcut: "Ctrl+Shift+K".into(),
+            global_shortcut: global_shortcut.into(),
             close_to_tray: true,
             autostart: false,
             default_view_mode: "split".into(),
@@ -1906,8 +2534,15 @@ mod tests {
             open_at_cursor: true,
             surface_width: None,
             surface_height: None,
-            toggle_visibility_shortcut: "Ctrl+Shift+K".into(),
-        };
+            toggle_visibility_shortcut: toggle_visibility_shortcut.into(),
+            last_known_base_dir: None,
+        }
+    }
+
+    #[cfg(desktop)]
+    #[test]
+    fn rejects_duplicate_shortcut_bindings() {
+        let config = test_app_config("Ctrl+Shift+K", "Ctrl+Shift+K");
 
         let error = match shortcut_bindings_from_config(&config) {
             Ok(_) => panic!("expected duplicate shortcut error"),
@@ -1915,6 +2550,29 @@ mod tests {
         };
 
         assert!(error.to_string().contains("must differ"));
+    }
+
+    #[cfg(desktop)]
+    #[test]
+    fn accepts_empty_shortcut_bindings() {
+        let config = test_app_config("", "");
+
+        let bindings = shortcut_bindings_from_config(&config).expect("empty shortcuts are valid");
+
+        assert!(bindings.open_notepad.is_none());
+        assert!(bindings.toggle_visibility.is_none());
+    }
+
+    #[cfg(desktop)]
+    #[test]
+    fn accepts_visibility_shortcut_when_quick_note_shortcut_is_empty() {
+        let config = test_app_config("", "Ctrl+Shift+H");
+
+        let bindings =
+            shortcut_bindings_from_config(&config).expect("single visibility shortcut is valid");
+
+        assert!(bindings.open_notepad.is_none());
+        assert!(bindings.toggle_visibility.is_some());
     }
 
     #[test]
@@ -1958,6 +2616,7 @@ mod tests {
             surface_width: None,
             surface_height: None,
             toggle_visibility_shortcut: String::new(),
+            last_known_base_dir: None,
         };
         let next = AppConfig {
             locale: "en-US".into(),
@@ -1990,6 +2649,7 @@ mod tests {
             surface_width: None,
             surface_height: None,
             toggle_visibility_shortcut: "Ctrl+Shift+H".into(),
+            last_known_base_dir: None,
         };
 
         assert_eq!(
