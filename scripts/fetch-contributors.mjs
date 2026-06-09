@@ -5,6 +5,11 @@ import { fileURLToPath } from "node:url";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const OUTPUT = resolve(__dirname, "../src/generated/contributors.json");
 
+function writeContributors(contributors) {
+  mkdirSync(dirname(OUTPUT), { recursive: true });
+  writeFileSync(OUTPUT, JSON.stringify(contributors, null, 2) + "\n");
+}
+
 const REPO = "Achilng/floral-notepaper";
 const API_URL = `https://api.github.com/repos/${REPO}/contributors?per_page=100`;
 
@@ -31,8 +36,7 @@ async function fetchContributors() {
 
 try {
   const contributors = await fetchContributors();
-  mkdirSync(dirname(OUTPUT), { recursive: true });
-  writeFileSync(OUTPUT, JSON.stringify(contributors, null, 2) + "\n");
+  writeContributors(contributors);
   console.log(`[contributors] wrote ${contributors.length} contributors`);
 } catch (err) {
   if (existsSync(OUTPUT)) {
@@ -41,7 +45,7 @@ try {
       `[contributors] API failed (${err.message}), keeping cached ${cached.length} contributors`,
     );
   } else {
-    writeFileSync(OUTPUT, "[]\n");
+    writeContributors([]);
     console.warn(`[contributors] API failed (${err.message}), wrote empty fallback`);
   }
 }
