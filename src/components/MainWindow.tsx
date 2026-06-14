@@ -14,8 +14,9 @@ import {
   tagPreviewBlocks,
 } from "../features/markdown/scrollSync";
 import {
-  chooseNotesDirectory,
+  chooseDataDirectory,
   getConfig,
+  migrateDataDir,
   normalizeViewMode,
   saveConfig,
 } from "../features/settings/api";
@@ -53,8 +54,8 @@ import {
   saveExternalFile,
   updateNote,
 } from "../features/notes/api";
-import { cleanUnusedImages } from "../features/images/api";
-import { useImagePaste } from "../features/images/useImagePaste";
+import { cleanUnusedImages, saveImageFromPath } from "../features/images/api";
+import { useImagePaste, insertTextAtCursor } from "../features/images/useImagePaste";
 import { useImageBaseDir } from "../features/images/useImageBaseDir";
 import type { ExternalFile, Note, NoteMetadata } from "../features/notes/types";
 import {
@@ -288,6 +289,30 @@ export function pinTileButtonTitle(isPinned: boolean): string {
   return isPinned ? "取消钉屏" : "钉到屏幕";
 }
 
+interface LoadEpoch {
+  // 开始一次新的异步加载，返回本次 epoch token；之后用 isCurrent 校验是否仍然有效
+  bump: () => number;
+  // 只读取当前 epoch 而不自增：用于"记录事件到达瞬间的代次，期间若发生切换则过期"
+  peek: () => number;
+  // 异步完成后调用：仅当期间未发生新的 bump（用户未切换/重载）时为 true
+  isCurrent: (token: number) => boolean;
+}
+
+// 统一封装"加载竞态守卫"：每次切换/加载笔记自增 epoch，异步结果回来后用
+// isCurrent 判断是否过期。集中此处后，新增异步加载路径只需 bump/isCurrent 两步，
+// 避免裸 ref 在多处内联导致的"忘记连线 → stale 结果覆盖新选中"竞态回归
+function useLoadEpoch(): LoadEpoch {
+  const ref = useRef(0);
+  return useMemo<LoadEpoch>(
+    () => ({
+      bump: () => (ref.current += 1),
+      peek: () => ref.current,
+      isCurrent: (token: number) => ref.current === token,
+    }),
+    [],
+  );
+}
+
 interface MainWindowProps {
   initialSettingsOpen?: boolean;
   initialConfig?: AppConfig;
@@ -325,9 +350,7 @@ export function MainWindow({
     createAboutUpdateReminderState(null),
   );
   const [settingsConfig, setSettingsConfig] = useState<AppConfig | null>(initialConfig ?? null);
-  const [savedNotesDir, setSavedNotesDir] = useState<string | null>(
-    initialConfig?.notesDir ?? null,
-  );
+  const [savedDataDir, setSavedDataDir] = useState<string | null>(initialConfig?.dataDir ?? null);
   const [noteTransitionKey, setNoteTransitionKey] = useState(0);
   const [deleteConfirm, setDeleteConfirm] = useState(false);
   const [deleteExiting, setDeleteExiting] = useState(false);
@@ -341,7 +364,9 @@ export function MainWindow({
   const [renamingCategory, setRenamingCategory] = useState<string | null>(null);
   const [renameCategoryValue, setRenameCategoryValue] = useState("");
   const [dragOverCategory, setDragOverCategory] = useState<string | null>(null);
-  const [settingsOverlay, setSettingsOverlay] = useState(() => window.innerWidth < 1080);
+  const [settingsOverlay, setSettingsOverlay] = useState(() =>
+    typeof window !== "undefined" ? window.innerWidth < 1080 : true,
+  );
   const [sidebarWidth, setSidebarWidth] = useState(280);
   const [isResizingSidebar, setIsResizingSidebar] = useState(false);
   const [splitRatio, setSplitRatio] = useState(0.5);
@@ -350,6 +375,7 @@ export function MainWindow({
   const [categoryMenu, setCategoryMenu] = useState<CategoryMenuState | null>(null);
   const [categoryMenuClosing, setCategoryMenuClosing] = useState(false);
   const [categoryMenuConfirmDelete, setCategoryMenuConfirmDelete] = useState(false);
+  const [categoryMenuHoverSuppressed, setCategoryMenuHoverSuppressed] = useState(false);
   const contentRef = useRef<HTMLTextAreaElement>(null);
   const windowLabelRef = useRef("main");
   const previewScrollRef = useRef<HTMLDivElement>(null);
@@ -364,9 +390,28 @@ export function MainWindow({
   const lastExternalSaveRef = useRef<number>(0);
   const imageBaseDir = useImageBaseDir();
   const saveStateRef = useRef(saveState);
+  const isMacOS = useMemo(() => {
+    return (
+      typeof navigator !== "undefined" &&
+      (/Mac|iPhone|iPad/.test(navigator.platform) || navigator.userAgent.includes("Mac"))
+    );
+  }, []);
   saveStateRef.current = saveState;
   const selectedIdRef = useRef(selectedId);
   selectedIdRef.current = selectedId;
+  const contentValueRef = useRef(content);
+  contentValueRef.current = content;
+  const titleValueRef = useRef(title);
+  titleValueRef.current = title;
+  const notesRef = useRef(notes);
+  notesRef.current = notes;
+  const externalFilesRef = useRef(externalFiles);
+  externalFilesRef.current = externalFiles;
+  // 每次"应用/切换当前笔记"都会自增；异步加载完成后若 epoch 已变化，说明用户
+  // 已切换到别处，该次结果直接丢弃，避免旧的加载结果覆盖新选中的笔记
+  const loadEpoch = useLoadEpoch();
+  // 串行化所有保存请求，避免自动保存与切换触发的保存并发写同一篇笔记
+  const saveQueueRef = useRef<Promise<unknown>>(Promise.resolve());
 
   const selectedNote = useMemo(
     () => notes.find((note) => note.id === selectedId) ?? null,
@@ -382,6 +427,8 @@ export function MainWindow({
   const updateStatusHydratedRef = useRef(false);
 
   const isExternal = selectedExternalFile !== null;
+  const isExternalRef = useRef(isExternal);
+  isExternalRef.current = isExternal;
 
   const noteMenuTarget = useMemo(
     () => notes.find((note) => note.id === noteMenu?.noteId) ?? null,
@@ -520,13 +567,22 @@ export function MainWindow({
   );
   const charCount = useMemo(() => countNoteChars(content), [content]);
 
-  const applyNote = useCallback((note: Note) => {
-    setSelectedId(note.id);
-    setTitle(note.title);
-    setContent(note.content);
-    setSaveState("saved");
-    setNoteTransitionKey((k) => k + 1);
-  }, []);
+  const applyNote = useCallback(
+    (note: Note) => {
+      // 立刻同步各 ref，保证保存快照与守卫在下一次渲染前就能读到最新值
+      loadEpoch.bump();
+      selectedIdRef.current = note.id;
+      titleValueRef.current = note.title;
+      contentValueRef.current = note.content;
+      saveStateRef.current = "saved";
+      setSelectedId(note.id);
+      setTitle(note.title);
+      setContent(note.content);
+      setSaveState("saved");
+      setNoteTransitionKey((k) => k + 1);
+    },
+    [loadEpoch],
+  );
 
   const replaceNoteMetadata = useCallback((note: Note) => {
     const metadata = metadataFromNote(note);
@@ -541,11 +597,14 @@ export function MainWindow({
 
   const loadNote = useCallback(
     async (id: string) => {
+      const epoch = loadEpoch.bump();
       const note = await getNote(id);
+      // 加载期间用户又切换/加载了别的笔记，丢弃本次结果
+      if (!loadEpoch.isCurrent(epoch)) return;
       applyNote(note);
       replaceNoteMetadata(note);
     },
-    [applyNote, replaceNoteMetadata],
+    [applyNote, replaceNoteMetadata, loadEpoch],
   );
 
   const refreshNotes = useCallback(async () => {
@@ -556,45 +615,59 @@ export function MainWindow({
   }, []);
 
   const clearCurrentNote = useCallback(() => {
+    loadEpoch.bump();
+    selectedIdRef.current = null;
+    titleValueRef.current = "";
+    contentValueRef.current = "";
+    saveStateRef.current = "idle";
     setSelectedId(null);
     setTitle("");
     setContent("");
     setSaveState("idle");
-  }, []);
+  }, [loadEpoch]);
 
-  const loadExternalFile = useCallback(async (filePath: string) => {
-    try {
-      const [fileContent, mtime] = await Promise.all([
-        readExternalFile(filePath),
-        getFileModifiedTime(filePath),
-      ]);
-      const fileName = filePath.split(/[\\/]/).pop() ?? filePath;
-      const displayTitle = fileName.replace(/\.(md|txt)$/i, "");
+  const loadExternalFile = useCallback(
+    async (filePath: string) => {
+      const epoch = loadEpoch.bump();
+      try {
+        const [fileContent, mtime] = await Promise.all([
+          readExternalFile(filePath),
+          getFileModifiedTime(filePath),
+        ]);
+        const fileName = filePath.split(/[\\/]/).pop() ?? filePath;
+        const displayTitle = fileName.replace(/\.(md|txt)$/i, "");
 
-      setExternalFiles((current) => {
-        if (current.some((f) => f.id === filePath)) {
-          return current;
-        }
-        return [
-          ...current,
-          {
-            id: filePath,
-            title: displayTitle,
-            filePath,
-          },
-        ];
-      });
+        setExternalFiles((current) => {
+          if (current.some((f) => f.id === filePath)) {
+            return current;
+          }
+          return [
+            ...current,
+            {
+              id: filePath,
+              title: displayTitle,
+              filePath,
+            },
+          ];
+        });
 
-      setSelectedId(filePath);
-      setTitle(displayTitle);
-      setContent(fileContent);
-      setSaveState("saved");
-      setNoteTransitionKey((k) => k + 1);
-      externalFileMtimeRef.current = mtime;
-    } catch (error) {
-      showToast(getErrorMessage(error));
-    }
-  }, []);
+        if (!loadEpoch.isCurrent(epoch)) return;
+        selectedIdRef.current = filePath;
+        titleValueRef.current = displayTitle;
+        contentValueRef.current = fileContent;
+        saveStateRef.current = "saved";
+        setSelectedId(filePath);
+        setTitle(displayTitle);
+        setContent(fileContent);
+        setSaveState("saved");
+        setNoteTransitionKey((k) => k + 1);
+        externalFileMtimeRef.current = mtime;
+      } catch (error) {
+        showToast(getErrorMessage(error));
+      }
+    },
+    [loadEpoch],
+  );
 
   useEffect(() => {
     try {
@@ -617,7 +690,7 @@ export function MainWindow({
         ]);
         if (cancelled) return;
         setSettingsConfig(loadedConfig);
-        setSavedNotesDir(loadedConfig.notesDir);
+        setSavedDataDir(loadedConfig.dataDir);
         setViewMode(normalizeViewMode(loadedConfig.defaultViewMode));
         setNotes(loadedNotes);
         setCategories(loadedCategories);
@@ -777,34 +850,48 @@ export function MainWindow({
 
   useEffect(() => {
     const unlisten = listen("notes-changed", () => {
-      void refreshNotes().then((loaded) => {
-        const currentId = selectedIdRef.current;
-        if (!currentId) return;
-        const stillExists = loaded.some((n) => n.id === currentId);
-        if (stillExists) {
-          if (saveStateRef.current !== "dirty") {
-            void getNote(currentId)
-              .then((note) => {
-                if (selectedIdRef.current !== currentId) return;
-                setTitle(note.title);
-                setContent(note.content);
-                setSaveState("saved");
-              })
-              .catch(() => undefined);
+      // 记录事件到达时的 epoch；其间用户一旦切换/加载了笔记，本次同步即过期，
+      // 不再用过期的列表快照去改选中或回填内容，避免把选中"拉回"刚保存的旧笔记
+      const epochAtEvent = loadEpoch.peek();
+      const isStale = () => !loadEpoch.isCurrent(epochAtEvent);
+      void refreshNotes()
+        .then((loaded) => {
+          if (isStale()) return;
+          const currentId = selectedIdRef.current;
+          if (!currentId) return;
+          const stillExists = loaded.some((n) => n.id === currentId);
+          if (stillExists) {
+            if (saveStateRef.current !== "dirty" && saveStateRef.current !== "saving") {
+              void getNote(currentId)
+                .then((note) => {
+                  if (isStale()) return;
+                  if (selectedIdRef.current !== currentId) return;
+                  if (saveStateRef.current === "dirty" || saveStateRef.current === "saving") {
+                    return;
+                  }
+                  titleValueRef.current = note.title;
+                  contentValueRef.current = note.content;
+                  saveStateRef.current = "saved";
+                  setTitle(note.title);
+                  setContent(note.content);
+                  setSaveState("saved");
+                })
+                .catch(() => undefined);
+            }
+          } else if (selectedNoteRef.current) {
+            if (loaded[0]) {
+              void loadNote(loaded[0].id);
+            } else {
+              clearCurrentNote();
+            }
           }
-        } else if (selectedNoteRef.current) {
-          if (loaded[0]) {
-            void loadNote(loaded[0].id);
-          } else {
-            clearCurrentNote();
-          }
-        }
-      });
+        })
+        .catch(() => undefined);
     });
     return () => {
       void unlisten.then((fn) => fn());
     };
-  }, [refreshNotes, loadNote, clearCurrentNote]);
+  }, [refreshNotes, loadNote, clearCurrentNote, loadEpoch]);
 
   useEffect(() => {
     function handleFocus() {
@@ -828,6 +915,47 @@ export function MainWindow({
       void unlisten.then((fn) => fn());
     };
   }, [loadExternalFile]);
+
+  useEffect(() => {
+    const TEXT_RE = /\.(md|markdown|txt)$/i;
+    const IMAGE_RE = /\.(png|jpe?g|gif|webp|bmp|svg)$/i;
+
+    const unlisten = getCurrentWindow().onDragDropEvent((event) => {
+      if (event.payload.type !== "drop") return;
+      const textPaths: string[] = [];
+      const imagePaths: string[] = [];
+
+      for (const p of event.payload.paths) {
+        if (TEXT_RE.test(p)) textPaths.push(p);
+        else if (IMAGE_RE.test(p)) imagePaths.push(p);
+      }
+
+      for (const p of textPaths) {
+        void loadExternalFile(p);
+      }
+
+      if (imagePaths.length > 0 && selectedIdRef.current && !isExternalRef.current) {
+        const noteId = selectedIdRef.current;
+        void (async () => {
+          const textarea = contentRef.current;
+          if (!textarea) return;
+          try {
+            const rels = await Promise.all(imagePaths.map((p) => saveImageFromPath(noteId, p)));
+            const markdown = rels.map((rel) => `![](${rel})`).join("\n");
+            insertTextAtCursor(textarea, setContent, markdown);
+            saveStateRef.current = "dirty";
+            setSaveState("dirty");
+          } catch (error) {
+            showToast(getErrorMessage(error));
+          }
+        })();
+      }
+    });
+
+    return () => {
+      void unlisten.then((fn) => fn());
+    };
+  }, [loadExternalFile, setContent]);
 
   useEffect(() => {
     const unlisten = listen<string>("open-note", (event) => {
@@ -881,9 +1009,13 @@ export function MainWindow({
       if (Date.now() - lastExternalSaveRef.current < 2000) return;
       try {
         const mtime = await getFileModifiedTime(selectedExternalFile.filePath);
+        if (selectedIdRef.current !== selectedExternalFile.id) return;
         if (mtime !== externalFileMtimeRef.current) {
           externalFileMtimeRef.current = mtime;
           const fileContent = await readExternalFile(selectedExternalFile.filePath);
+          if (selectedIdRef.current !== selectedExternalFile.id) return;
+          contentValueRef.current = fileContent;
+          saveStateRef.current = "saved";
           setContent(fileContent);
           setSaveState("saved");
         }
@@ -929,60 +1061,99 @@ export function MainWindow({
       setCategoryMenu(null);
       setCategoryMenuClosing(false);
       setCategoryMenuConfirmDelete(false);
+      setCategoryMenuHoverSuppressed(false);
     }, 150);
     return () => window.clearTimeout(timer);
   }, [categoryMenuClosing, categoryMenu]);
 
-  const saveCurrentNote = useCallback(async () => {
-    if (!selectedId) return null;
+  useEffect(() => {
+    if (!categoryMenuHoverSuppressed || !categoryMenu) return;
+    const releaseHover = () => setCategoryMenuHoverSuppressed(false);
+    window.addEventListener("mousemove", releaseHover, { once: true });
+    window.addEventListener("mousedown", releaseHover, { once: true });
+    return () => {
+      window.removeEventListener("mousemove", releaseHover);
+      window.removeEventListener("mousedown", releaseHover);
+    };
+  }, [categoryMenuHoverSuppressed, categoryMenu]);
 
-    if (isExternal && selectedExternalFile) {
-      setSaveState("saving");
+  const switchCategoryMenuPanel = useCallback((confirmDelete: boolean) => {
+    setCategoryMenuHoverSuppressed(true);
+    setCategoryMenuConfirmDelete(confirmDelete);
+    (document.activeElement as HTMLElement | null)?.blur();
+  }, []);
+
+  const performSave = useCallback(
+    async (force: boolean): Promise<boolean> => {
+      // 非强制保存（自动保存、切换前保存）在没有未保存修改时直接视为成功
+      if (!force && saveStateRef.current !== "dirty") return true;
+      const id = selectedIdRef.current;
+      if (!id) return false;
+
+      // 在保存瞬间对当前笔记做快照；之后用户切换笔记不影响本次写入的内容，
+      // 保存完成后也只在"仍停留在这篇笔记"时才更新保存状态
+      const titleSnapshot = titleValueRef.current;
+      const contentSnapshot = contentValueRef.current;
+      const stillCurrent = () => selectedIdRef.current === id;
+      const settleSaveState = (state: SaveState) => {
+        if (!stillCurrent()) return;
+        saveStateRef.current = state;
+        setSaveState(state);
+      };
+
+      const externalFile = externalFilesRef.current.find((file) => file.id === id) ?? null;
+
+      settleSaveState("saving");
       try {
-        await saveExternalFile(selectedExternalFile.filePath, content);
-        lastExternalSaveRef.current = Date.now();
-        const mtime = await getFileModifiedTime(selectedExternalFile.filePath);
-        externalFileMtimeRef.current = mtime;
-        setSaveState("saved");
-        return { id: selectedId, title, content } as Note;
+        if (externalFile) {
+          await saveExternalFile(externalFile.filePath, contentSnapshot);
+          lastExternalSaveRef.current = Date.now();
+          const mtime = await getFileModifiedTime(externalFile.filePath);
+          if (stillCurrent()) {
+            externalFileMtimeRef.current = mtime;
+          }
+          settleSaveState(contentValueRef.current === contentSnapshot ? "saved" : "dirty");
+        } else {
+          const category = notesRef.current.find((note) => note.id === id)?.category ?? "";
+          const note = await updateNote(id, {
+            title: titleSnapshot,
+            content: contentSnapshot,
+            category,
+          });
+          replaceNoteMetadata(note);
+          const contentChanged =
+            contentValueRef.current !== contentSnapshot || titleValueRef.current !== titleSnapshot;
+          settleSaveState(contentChanged ? "dirty" : "saved");
+        }
+        return true;
       } catch (error) {
-        setSaveState("error");
+        settleSaveState("error");
         showToast(getErrorMessage(error));
-        return null;
+        return false;
       }
-    }
+    },
+    [replaceNoteMetadata],
+  );
 
-    setSaveState("saving");
-    try {
-      const category = selectedNote?.category ?? "";
-      const note = await updateNote(selectedId, { title, content, category });
-      replaceNoteMetadata(note);
-      setSaveState("saved");
-      return note;
-    } catch (error) {
-      setSaveState("error");
-      showToast(getErrorMessage(error));
-      return null;
-    }
-  }, [
-    content,
-    isExternal,
-    replaceNoteMetadata,
-    selectedExternalFile,
-    selectedId,
-    selectedNote,
-    title,
-  ]);
+  const saveCurrentNote = useCallback(
+    (force = false): Promise<boolean> => {
+      const run = saveQueueRef.current.then(() => performSave(force));
+      saveQueueRef.current = run.catch(() => undefined);
+      return run;
+    },
+    [performSave],
+  );
 
   useEffect(() => {
     const unlisten = listen<UpdateInstallPrepareRequest>("update://prepare-install", (event) => {
       const respond = async () => {
         const windowLabel = windowLabelRef.current;
+        // 无未保存修改时直接上报就绪：避免排进 saveQueueRef，被正在执行的
+        // 防抖自动保存拖住、不必要地延迟安装准备响应
         if (saveStateRef.current !== "dirty") {
           await reportInstallPreparation(event.payload.requestId, windowLabel, "ready");
           return;
         }
-
         const saved = await saveCurrentNote();
         await reportInstallPreparation(
           event.payload.requestId,
@@ -1018,7 +1189,7 @@ export function MainWindow({
     function handleKeyDown(event: KeyboardEvent) {
       if ((event.ctrlKey || event.metaKey) && event.key === "s") {
         event.preventDefault();
-        void saveCurrentNote();
+        void saveCurrentNote(true);
       }
     }
 
@@ -1040,6 +1211,9 @@ export function MainWindow({
 
     return () => window.clearTimeout(timer);
   }, [
+    // content 与 title 用于在持续输入时不断重置防抖计时器
+    content,
+    title,
     isExternal,
     saveCurrentNote,
     saveState,
@@ -1049,9 +1223,7 @@ export function MainWindow({
   ]);
 
   const handleNewNote = async () => {
-    if (saveState === "dirty") {
-      await saveCurrentNote();
-    }
+    await saveCurrentNote();
     try {
       const note = await createNote({ title: "", content: "", category: activeCategory });
       replaceNoteMetadata(note);
@@ -1072,19 +1244,36 @@ export function MainWindow({
     try {
       const config = await getConfig();
       setSettingsConfig(config);
-      setSavedNotesDir(config.notesDir);
+      setSavedDataDir(config.dataDir);
       setViewMode(normalizeViewMode(config.defaultViewMode));
     } catch (error) {
       showToast(getErrorMessage(error));
     }
   };
 
-  const handleChooseNotesDir = async () => {
+  const handleMigrateDataDir = async () => {
     if (!settingsConfig) return;
     try {
-      const notesDir = await chooseNotesDirectory();
-      if (!notesDir) return;
-      handleSettingsChange({ ...settingsConfig, notesDir });
+      const dir = await chooseDataDirectory();
+      if (!dir) return;
+      // 后端会在所选目录下创建 floral 子目录存放数据；先告知用户，
+      // 避免其在文件管理器打开所选目录看到"空文件夹"而误判数据丢失
+      const confirmed = window.confirm(
+        t("settings.dataDir.confirmSubdir", {
+          dir,
+          defaultValue: "数据将存放在「{{dir}}」下的 floral 子文件夹中，是否继续？",
+        }),
+      );
+      if (!confirmed) return;
+      const savedConfig = await migrateDataDir(dir);
+      setSettingsConfig(savedConfig);
+      setSavedDataDir(savedConfig.dataDir);
+      const loadedNotes = await refreshNotes();
+      if (loadedNotes[0]) {
+        await loadNote(loadedNotes[0].id);
+      } else {
+        clearCurrentNote();
+      }
     } catch (error) {
       showToast(getErrorMessage(error));
     }
@@ -1098,7 +1287,7 @@ export function MainWindow({
         clearTimeout(settingsSaveTimer.current);
       }
       settingsSaveTimer.current = setTimeout(async () => {
-        const previousNotesDir = savedNotesDir ?? nextConfig.notesDir;
+        const previousDataDir = savedDataDir ?? nextConfig.dataDir;
         const normalizedConfig = {
           ...nextConfig,
           defaultViewMode: normalizeViewMode(nextConfig.defaultViewMode),
@@ -1107,10 +1296,10 @@ export function MainWindow({
         try {
           const savedConfig = await saveConfig(normalizedConfig);
           setSettingsConfig(savedConfig);
-          setSavedNotesDir(savedConfig.notesDir);
+          setSavedDataDir(savedConfig.dataDir);
           setViewMode(normalizeViewMode(savedConfig.defaultViewMode));
 
-          if (savedConfig.notesDir !== previousNotesDir) {
+          if (savedConfig.dataDir !== previousDataDir) {
             const loadedNotes = await refreshNotes();
             if (loadedNotes[0]) {
               await loadNote(loadedNotes[0].id);
@@ -1123,7 +1312,7 @@ export function MainWindow({
         }
       }, 300);
     },
-    [savedNotesDir, refreshNotes, loadNote, clearCurrentNote],
+    [savedDataDir, refreshNotes, loadNote, clearCurrentNote],
   );
 
   const handleSettingsChange = useCallback(
@@ -1156,10 +1345,8 @@ export function MainWindow({
 
   const handleImportNote = async () => {
     try {
-      if (selectedId && saveState === "dirty") {
-        const saved = await saveCurrentNote();
-        if (!saved) return;
-      }
+      const saved = await saveCurrentNote();
+      if (!saved) return;
 
       const note = await importMarkdownNote(activeCategory);
       if (!note) return;
@@ -1174,9 +1361,8 @@ export function MainWindow({
   const handleSelectNote = async (id: string) => {
     if (id === selectedId) return;
     setDeleteConfirm(false);
-    if (saveState === "dirty") {
-      await saveCurrentNote();
-    }
+    // 排队保存：等待可能在途的自动保存，并把尚未落盘的修改一并存掉
+    await saveCurrentNote();
 
     setIsLoading(true);
     try {
@@ -1191,19 +1377,23 @@ export function MainWindow({
   const handleSelectExternalFile = async (id: string) => {
     if (id === selectedId) return;
     setDeleteConfirm(false);
-    if (saveState === "dirty") {
-      await saveCurrentNote();
-    }
+    await saveCurrentNote();
 
     const file = externalFiles.find((f) => f.id === id);
     if (!file) return;
 
     setIsLoading(true);
+    const epoch = loadEpoch.bump();
     try {
       const [fileContent, mtime] = await Promise.all([
         readExternalFile(file.filePath),
         getFileModifiedTime(file.filePath),
       ]);
+      if (!loadEpoch.isCurrent(epoch)) return;
+      selectedIdRef.current = id;
+      titleValueRef.current = file.title;
+      contentValueRef.current = fileContent;
+      saveStateRef.current = "saved";
       setSelectedId(id);
       setTitle(file.title);
       setContent(fileContent);
@@ -1273,7 +1463,7 @@ export function MainWindow({
 
   const handleExportNote = async (note: NoteMetadata) => {
     try {
-      if (note.id === selectedId && saveState === "dirty") {
+      if (note.id === selectedId) {
         const saved = await saveCurrentNote();
         if (!saved) return;
       }
@@ -1374,7 +1564,9 @@ export function MainWindow({
   };
 
   const markDirty = () => {
-    if (selectedId) setSaveState("dirty");
+    if (!selectedId) return;
+    saveStateRef.current = "dirty";
+    setSaveState("dirty");
   };
 
   const ensureNoteSaved = useCallback(async (): Promise<string | null> => {
@@ -1676,7 +1868,7 @@ export function MainWindow({
   const handlePinEntry = async () => {
     if (!selectedId) return;
     const isPinned = pinnedTileIds.has(selectedId);
-    if (!isPinned && saveState === "dirty") {
+    if (!isPinned) {
       await saveCurrentNote();
     }
     try {
@@ -1691,18 +1883,18 @@ export function MainWindow({
 
   const selectedTilePinned = selectedId ? pinnedTileIds.has(selectedId) : false;
 
-  const handleTitleBarDrag = (event: MouseEvent<HTMLDivElement>) => {
-    if ((event.target as HTMLElement).closest("button")) return;
-    void startCurrentWindowDrag().catch(() => undefined);
-  };
-
   const toggleMaximize = () => {
     void toggleMaximizeCurrentWindow().then(() => isCurrentWindowMaximized().then(setIsMaximized));
   };
 
-  const handleTitleBarDoubleClick = (event: MouseEvent<HTMLDivElement>) => {
+  const handleTitleBarMouseDown = (event: MouseEvent<HTMLDivElement>) => {
     if ((event.target as HTMLElement).closest("button")) return;
-    toggleMaximize();
+    if (event.button !== 0) return;
+    if (event.detail === 2) {
+      toggleMaximize();
+      return;
+    }
+    void startCurrentWindowDrag().catch(() => undefined);
   };
 
   const handleMinimize = () => {
@@ -1727,16 +1919,19 @@ export function MainWindow({
       <div className="relative noise-bg bg-cloud overflow-hidden flex flex-col flex-1">
         <BackgroundLayer config={settingsConfig} />
         <div
-          className="relative z-10 flex items-center justify-between pl-5 pr-0 h-11 bg-paper/55 backdrop-blur-[1px] border-b border-paper-deep/30 shrink-0 select-none cursor-default"
-          onMouseDown={handleTitleBarDrag}
-          onDoubleClick={handleTitleBarDoubleClick}
+          className={`relative z-10 flex items-center justify-between h-11 bg-paper/55 backdrop-blur-[1px] border-b border-paper-deep/30 shrink-0 select-none cursor-default ${
+            isMacOS ? "pl-20 pr-5" : "pl-5 pr-0"
+          }`}
+          onMouseDown={handleTitleBarMouseDown}
         >
           <div className="flex items-center gap-3 min-w-0">
             <span className="text-[15px] font-serif font-medium text-ink-soft tracking-wide leading-none">
               花笺
             </span>
-            <span className="text-[11px] text-ink-ghost font-body leading-none">—</span>
-            <span className="text-[11px] text-ink-faint font-body truncate max-w-[240px] leading-none">
+            <span className="text-[11px] text-ink-ghost font-body leading-none translate-y-px">
+              —
+            </span>
+            <span className="text-[11px] text-ink-faint font-body truncate max-w-[240px] leading-none translate-y-px">
               {title ||
                 selectedNote?.preview ||
                 t("common.untitledNote", { defaultValue: "无标题笔记" })}
@@ -1836,68 +2031,72 @@ export function MainWindow({
               ) : null}
             </button>
 
-            <div className="w-px h-4 bg-paper-deep/30 mx-0.5" />
+            {!isMacOS && (
+              <>
+                <div className="w-px h-4 bg-paper-deep/30 mx-0.5" />
 
-            <button
-              onClick={handleMinimize}
-              className="w-11 h-11 flex items-center justify-center text-ink-ghost hover:text-ink-soft hover:bg-paper-warm transition-all cursor-pointer"
-              title={t("main.window.minimize", { defaultValue: "最小化" })}
-            >
-              <svg width="12" height="12" viewBox="0 0 12 12">
-                <rect x="1" y="5.5" width="10" height="1" fill="currentColor" rx="0.5" />
-              </svg>
-            </button>
-            <button
-              onClick={handleMaximize}
-              className="w-11 h-11 flex items-center justify-center text-ink-ghost hover:text-ink-soft hover:bg-paper-warm transition-all cursor-pointer"
-              title={
-                isMaximized
-                  ? t("main.window.restore", { defaultValue: "还原" })
-                  : t("main.window.maximize", { defaultValue: "最大化" })
-              }
-            >
-              {isMaximized ? (
-                <svg
-                  width="12"
-                  height="12"
-                  viewBox="0 0 12 12"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="1.2"
+                <button
+                  onClick={handleMinimize}
+                  className="w-11 h-11 flex items-center justify-center text-ink-ghost hover:text-ink-soft hover:bg-paper-warm transition-all cursor-pointer"
+                  title={t("main.window.minimize", { defaultValue: "最小化" })}
                 >
-                  <rect x="3" y="3" width="7" height="7" rx="1" />
-                  <path d="M3 5H2V2a1 1 0 0 1 1-1h5v1" />
-                </svg>
-              ) : (
-                <svg
-                  width="12"
-                  height="12"
-                  viewBox="0 0 12 12"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="1.2"
+                  <svg width="12" height="12" viewBox="0 0 12 12">
+                    <rect x="1" y="5.5" width="10" height="1" fill="currentColor" rx="0.5" />
+                  </svg>
+                </button>
+                <button
+                  onClick={handleMaximize}
+                  className="w-11 h-11 flex items-center justify-center text-ink-ghost hover:text-ink-soft hover:bg-paper-warm transition-all cursor-pointer"
+                  title={
+                    isMaximized
+                      ? t("main.window.restore", { defaultValue: "还原" })
+                      : t("main.window.maximize", { defaultValue: "最大化" })
+                  }
                 >
-                  <rect x="1.5" y="1.5" width="9" height="9" rx="1.5" />
-                </svg>
-              )}
-            </button>
-            <button
-              onClick={handleClose}
-              className="w-11 h-11 flex items-center justify-center text-ink-ghost hover:text-red-500 hover:bg-danger-bg transition-all cursor-pointer"
-              title={t("main.window.close", { defaultValue: "关闭" })}
-            >
-              <svg
-                width="12"
-                height="12"
-                viewBox="0 0 12 12"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="1.5"
-                strokeLinecap="round"
-              >
-                <path d="M2 2l8 8M10 2l-8 8" />
-              </svg>
-            </button>
+                  {isMaximized ? (
+                    <svg
+                      width="12"
+                      height="12"
+                      viewBox="0 0 12 12"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="1.2"
+                    >
+                      <rect x="3" y="3" width="7" height="7" rx="1" />
+                      <path d="M3 5H2V2a1 1 0 0 1 1-1h5v1" />
+                    </svg>
+                  ) : (
+                    <svg
+                      width="12"
+                      height="12"
+                      viewBox="0 0 12 12"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="1.2"
+                    >
+                      <rect x="1.5" y="1.5" width="9" height="9" rx="1.5" />
+                    </svg>
+                  )}
+                </button>
+                <button
+                  onClick={handleClose}
+                  className="w-11 h-11 flex items-center justify-center text-ink-ghost hover:text-red-500 hover:bg-danger-bg transition-all cursor-pointer"
+                  title={t("main.window.close", { defaultValue: "关闭" })}
+                >
+                  <svg
+                    width="12"
+                    height="12"
+                    viewBox="0 0 12 12"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="1.5"
+                    strokeLinecap="round"
+                  >
+                    <path d="M2 2l8 8M10 2l-8 8" />
+                  </svg>
+                </button>
+              </>
+            )}
           </div>
         </div>
 
@@ -2006,7 +2205,14 @@ export function MainWindow({
                     : ""}
                 </span>
                 <button
-                  onClick={() => setShowCategoryInput(true)}
+                  onMouseDown={(e) => e.preventDefault()}
+                  onClick={() => {
+                    if (showCategoryInput && categoryInputValue.trim()) {
+                      void handleCreateCategory();
+                      return;
+                    }
+                    setShowCategoryInput(true);
+                  }}
                   className="text-[10px] text-ink-ghost hover:text-bamboo transition-colors cursor-pointer"
                   title={t("main.category.new", { defaultValue: "新建分类" })}
                 >
@@ -2537,7 +2743,7 @@ export function MainWindow({
                 </button>
 
                 <button
-                  onClick={() => void saveCurrentNote()}
+                  onClick={() => void saveCurrentNote(true)}
                   disabled={!selectedId || saveState === "saving"}
                   className="px-2.5 h-7 flex items-center justify-center rounded-lg text-[11px] text-ink-ghost hover:text-ink-faint hover:bg-paper-warm transition-all cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed"
                   title={t("common.save", { defaultValue: "保存" })}
@@ -2553,6 +2759,7 @@ export function MainWindow({
                       {t("main.editor.confirmDelete", { defaultValue: "确认删除？" })}
                     </span>
                     <button
+                      onMouseDown={(event) => event.preventDefault()}
                       onClick={() => {
                         setDeleteExiting(true);
                         setTimeout(() => {
@@ -2561,11 +2768,12 @@ export function MainWindow({
                           void handleDeleteNote();
                         }, 150);
                       }}
-                      className="px-2 h-6 rounded-md text-[11px] text-cloud bg-red-400 hover:bg-red-500 transition-colors cursor-pointer whitespace-nowrap"
+                      className="px-2 h-6 rounded-md text-[11px] text-cloud bg-red-400 hover:bg-red-500 transition-colors cursor-pointer whitespace-nowrap outline-none"
                     >
                       {t("common.delete", { defaultValue: "删除" })}
                     </button>
                     <button
+                      onMouseDown={(event) => event.preventDefault()}
                       onClick={() => {
                         setDeleteExiting(true);
                         setTimeout(() => {
@@ -2573,7 +2781,7 @@ export function MainWindow({
                           setDeleteConfirm(false);
                         }, 150);
                       }}
-                      className="px-2 h-6 rounded-md text-[11px] text-ink-faint hover:text-ink-soft hover:bg-paper-warm transition-colors cursor-pointer"
+                      className="px-2 h-6 rounded-md text-[11px] text-ink-faint hover:text-ink-soft hover:bg-paper-warm transition-colors cursor-pointer outline-none"
                     >
                       {t("common.cancel", { defaultValue: "取消" })}
                     </button>
@@ -2851,7 +3059,7 @@ export function MainWindow({
                 <SettingsPanel
                   config={settingsConfig}
                   onChange={handleSettingsChange}
-                  onChooseNotesDir={() => void handleChooseNotesDir()}
+                  onMigrateDataDir={() => void handleMigrateDataDir()}
                   onClose={handleCloseSettings}
                 />
               ) : null}
@@ -2861,7 +3069,7 @@ export function MainWindow({
       </div>
       {noteMenu && noteMenuTarget && (
         <div
-          className={`fixed z-[9999] min-w-[168px] py-1.5 bg-cloud/95 backdrop-blur-sm border border-paper-deep/50 rounded-lg overflow-hidden select-none ${noteMenuClosing ? "animate-menu-exit" : "animate-menu-enter"}`}
+          className={`popup-menu fixed z-[9999] min-w-[168px] py-1.5 bg-cloud/95 backdrop-blur-sm border border-paper-deep/50 rounded-lg overflow-hidden select-none ${noteMenuClosing ? "animate-menu-exit" : "animate-menu-enter"}`}
           style={{ left: noteMenu.x, top: noteMenu.y }}
           onMouseDown={(event) => event.stopPropagation()}
         >
@@ -2923,12 +3131,13 @@ export function MainWindow({
 
       {categoryMenu && (
         <div
-          className={`fixed z-[9999] min-w-[140px] py-1.5 bg-cloud/95 backdrop-blur-sm border border-paper-deep/50 rounded-lg overflow-hidden select-none ${categoryMenuClosing ? "animate-menu-exit" : "animate-menu-enter"}`}
+          className={`popup-menu fixed z-[9999] min-w-[140px] py-1.5 bg-cloud/95 backdrop-blur-sm border border-paper-deep/50 rounded-lg overflow-hidden select-none ${categoryMenuClosing ? "animate-menu-exit" : "animate-menu-enter"}`}
+          data-hover-suppressed={categoryMenuHoverSuppressed ? "" : undefined}
           style={{ left: categoryMenu.x, top: categoryMenu.y }}
           onMouseDown={(event) => event.stopPropagation()}
         >
           {categoryMenuConfirmDelete ? (
-            <div className="animate-menu-slide-left">
+            <div key="category-confirm" className="animate-menu-slide-left">
               <div className="px-3 py-1.5 text-[11px] font-body text-ink-faint border-b border-paper-deep/20">
                 {t("main.category.confirmDelete", {
                   category: categoryMenu.category,
@@ -2936,23 +3145,25 @@ export function MainWindow({
                 })}
               </div>
               <button
+                onMouseDown={(event) => event.preventDefault()}
                 onClick={() => {
                   void handleDeleteCategory(categoryMenu.category);
                   setCategoryMenuClosing(true);
                 }}
-                className="w-full text-left px-3 py-1.5 text-[12px] font-body text-red-400 hover:bg-danger-bg hover:text-red-500 transition-colors cursor-pointer"
+                className="w-full text-left px-3 py-1.5 text-[12px] font-body text-red-400 hover:bg-danger-bg hover:text-red-500 transition-colors cursor-pointer outline-none"
               >
                 {t("main.category.confirmDeleteAction", { defaultValue: "确认删除" })}
               </button>
               <button
-                onClick={() => setCategoryMenuConfirmDelete(false)}
-                className="w-full text-left px-3 py-1.5 text-[12px] font-body text-ink-soft hover:bg-bamboo-mist/60 hover:text-bamboo transition-colors cursor-pointer"
+                onMouseDown={(event) => event.preventDefault()}
+                onClick={() => switchCategoryMenuPanel(false)}
+                className="w-full text-left px-3 py-1.5 text-[12px] font-body text-ink-soft hover:bg-bamboo-mist/60 hover:text-bamboo transition-colors cursor-pointer outline-none"
               >
                 {t("common.cancel", { defaultValue: "取消" })}
               </button>
             </div>
           ) : (
-            <div className="animate-menu-slide-right">
+            <div key="category-main" className="animate-menu-slide-right">
               <button
                 onClick={() => {
                   setCategoryMenuClosing(true);
@@ -2964,8 +3175,9 @@ export function MainWindow({
                 {t("main.category.rename", { defaultValue: "重命名" })}
               </button>
               <button
-                onClick={() => setCategoryMenuConfirmDelete(true)}
-                className="w-full text-left px-3 py-1.5 text-[12px] font-body text-red-400 hover:bg-danger-bg hover:text-red-500 transition-colors cursor-pointer border-t border-paper-deep/20"
+                onMouseDown={(event) => event.preventDefault()}
+                onClick={() => switchCategoryMenuPanel(true)}
+                className="w-full text-left px-3 py-1.5 text-[12px] font-body text-red-400 hover:bg-danger-bg hover:text-red-500 transition-colors cursor-pointer border-t border-paper-deep/20 outline-none"
               >
                 {t("main.category.delete", { defaultValue: "删除分类" })}
               </button>

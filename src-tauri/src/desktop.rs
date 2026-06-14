@@ -3,6 +3,8 @@ use crate::{
     services::notes::{default_store, AppConfig, AppError},
 };
 use serde::{Deserialize, Serialize};
+#[cfg(target_os = "macos")]
+use std::sync::OnceLock;
 use std::{
     error::Error,
     sync::{
@@ -422,6 +424,9 @@ const TRAY_QUICK_NOTE_ID: &str = "quick-note";
 const TRAY_TOGGLE_CLOSE_TO_TRAY_ID: &str = "toggle-close-to-tray";
 const TRAY_TOGGLE_AUTOSTART_ID: &str = "toggle-autostart";
 const TRAY_QUIT_ID: &str = "quit";
+
+#[cfg(target_os = "macos")]
+static FULLSCREEN_HIDING: AtomicBool = AtomicBool::new(false);
 const NOTEPAD_POOL_CAPACITY: usize = 2;
 
 /// Stores the file path passed as a command-line argument on cold start.
@@ -1052,6 +1057,14 @@ fn toggle_app_visibility(app: &AppHandle) {
             let _ = window.hide();
         }
     }
+
+    if labels.is_empty() {
+        if let Err(error) = show_main_window(app) {
+            eprintln!("failed to show main window from visibility toggle: {error}");
+        }
+        return;
+    }
+
     state.hide_windows(labels);
 }
 
@@ -1175,6 +1188,11 @@ pub fn handle_window_event(window: &Window, event: &WindowEvent) {
         MainWindowCloseAction::AllowClose => {}
         MainWindowCloseAction::HideToTray => {
             api.prevent_close();
+            #[cfg(target_os = "macos")]
+            if window.is_fullscreen().unwrap_or(false) {
+                hide_fullscreen_window(window);
+                return;
+            }
             if let Err(error) = window.hide() {
                 eprintln!("failed to hide main window to tray: {error}");
             }
@@ -1185,6 +1203,65 @@ pub fn handle_window_event(window: &Window, event: &WindowEvent) {
             window.app_handle().exit(0);
         }
     }
+}
+
+/// Exit fullscreen and hide the window once the fullscreen exit animation completes.
+#[cfg(target_os = "macos")]
+fn hide_fullscreen_window(window: &Window) {
+    use block2::RcBlock;
+    use objc2_app_kit::NSView;
+    use objc2_foundation::{NSNotificationCenter, NSString};
+    use raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
+    use std::rc::Rc;
+
+    let Ok(handle) = window.window_handle() else {
+        let _ = window.hide();
+        return;
+    };
+    let RawWindowHandle::AppKit(app_kit) = handle.as_raw() else {
+        let _ = window.hide();
+        return;
+    };
+
+    // SAFETY: ns_view is a valid pointer from the window handle, on the main thread.
+    let ns_view: objc2::rc::Retained<NSView> =
+        unsafe { objc2::rc::Retained::retain(app_kit.ns_view.as_ptr().cast()) }
+            .expect("failed to retain NSView");
+    let Some(ns_window) = ns_view.window() else {
+        let _ = window.hide();
+        return;
+    };
+
+    let retained = window.app_handle().clone();
+    let label = window.label().to_string();
+    let observer_holder: Rc<OnceLock<objc2::rc::Retained<objc2::runtime::AnyObject>>> =
+        Rc::new(OnceLock::new());
+    let observer_ref = Rc::clone(&observer_holder);
+    let block = RcBlock::new(move |_notification: std::ptr::NonNull<_>| {
+        if FULLSCREEN_HIDING.swap(false, Ordering::SeqCst) {
+            if let Some(w) = retained.get_webview_window(&label) {
+                let _ = w.hide();
+            }
+        }
+        if let Some(obs) = observer_ref.get() {
+            unsafe {
+                NSNotificationCenter::defaultCenter().removeObserver(obs);
+            }
+        }
+    });
+    let name = NSString::from_str("NSWindowDidExitFullScreenNotification");
+    let observer = unsafe {
+        NSNotificationCenter::defaultCenter().addObserverForName_object_queue_usingBlock(
+            Some(&name),
+            Some(&ns_window),
+            None,
+            &block,
+        )
+    };
+    let _ = observer_holder.set(observer.into());
+
+    FULLSCREEN_HIDING.store(true, Ordering::SeqCst);
+    let _ = window.set_fullscreen(false);
 }
 
 fn main_window_close_action(app_is_exiting: bool, close_to_tray: bool) -> MainWindowCloseAction {
@@ -1331,7 +1408,9 @@ pub fn show_main_window(app: &AppHandle) -> Result<(), AppError> {
                 min_width: 900.0,
                 min_height: 620.0,
             },
-            decorations: false,
+            // On macOS, tauri.macos.conf.json sets titleBarStyle: "Overlay"
+            // with native traffic lights; decorations: false would conflict.
+            decorations: !cfg!(target_os = "macos"),
             always_on_top: false,
             shadow: true,
             skip_taskbar: false,
@@ -1711,7 +1790,7 @@ fn open_or_focus_window(
         return Ok(label.to_string());
     }
 
-    let window = WebviewWindowBuilder::new(app, label, WebviewUrl::App(opts.url.into()))
+    let builder = WebviewWindowBuilder::new(app, label, WebviewUrl::App(opts.url.into()))
         .title(opts.title)
         .inner_size(opts.specs.width, opts.specs.height)
         .min_inner_size(opts.specs.min_width, opts.specs.min_height)
@@ -1721,8 +1800,23 @@ fn open_or_focus_window(
         .always_on_top(opts.always_on_top)
         .shadow(opts.shadow)
         .skip_taskbar(opts.skip_taskbar)
-        .visible(false)
-        .build()?;
+        .visible(false);
+
+    // 仅主窗口使用 macOS 原生红绿灯（Overlay 标题栏）。notepad / tile 是
+    // decorations: false 的透明无边框窗口，叠加红绿灯会渲染在内容区上方造成冲突
+    #[cfg(target_os = "macos")]
+    let builder = if label == MAIN_WINDOW_LABEL {
+        builder
+            .title_bar_style(tauri::TitleBarStyle::Overlay)
+            .hidden_title(true)
+            .traffic_light_position(tauri::Position::Logical(tauri::LogicalPosition::new(
+                14.0, 20.0,
+            )))
+    } else {
+        builder
+    };
+
+    let window = builder.build()?;
 
     apply_window_bounds(&window, opts.bounds)?;
 
@@ -2434,7 +2528,7 @@ mod tests {
     fn test_app_config(global_shortcut: &str, toggle_visibility_shortcut: &str) -> AppConfig {
         AppConfig {
             locale: "zh-CN".into(),
-            notes_dir: "D:\\notes".into(),
+            data_dir: Some("D:\\notes".into()),
             global_shortcut: global_shortcut.into(),
             close_to_tray: true,
             autostart: false,
@@ -2463,6 +2557,7 @@ mod tests {
             surface_width: None,
             surface_height: None,
             toggle_visibility_shortcut: toggle_visibility_shortcut.into(),
+            notes_dir: None,
             last_known_base_dir: None,
         }
     }
@@ -2515,7 +2610,7 @@ mod tests {
     fn detects_runtime_config_changes() {
         let previous = AppConfig {
             locale: "zh-CN".into(),
-            notes_dir: "D:\\notes".into(),
+            data_dir: Some("D:\\notes".into()),
             global_shortcut: "Ctrl+Space".into(),
             close_to_tray: true,
             autostart: false,
@@ -2544,11 +2639,12 @@ mod tests {
             surface_width: None,
             surface_height: None,
             toggle_visibility_shortcut: String::new(),
+            notes_dir: None,
             last_known_base_dir: None,
         };
         let next = AppConfig {
             locale: "en-US".into(),
-            notes_dir: "D:\\other-notes".into(),
+            data_dir: Some("D:\\other-notes".into()),
             global_shortcut: "Alt+Space".into(),
             close_to_tray: false,
             autostart: true,
@@ -2577,6 +2673,7 @@ mod tests {
             surface_width: None,
             surface_height: None,
             toggle_visibility_shortcut: "Ctrl+Shift+H".into(),
+            notes_dir: None,
             last_known_base_dir: None,
         };
 

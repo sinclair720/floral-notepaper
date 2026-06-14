@@ -6,7 +6,7 @@ pub mod updater;
 
 use locales::Locale;
 use services::notes::{default_store, AppConfig, AppError, Note, NoteMetadata, SaveNoteRequest};
-use std::{fs, path::PathBuf};
+use std::{env, fs, io::Write, path::PathBuf};
 use tauri::{AppHandle, Emitter, Manager};
 
 #[tauri::command]
@@ -149,15 +149,27 @@ fn images_save(note_id: String, data: Vec<u8>, extension: String) -> Result<Stri
 }
 
 #[tauri::command]
+fn images_save_from_path(note_id: String, file_path: String) -> Result<String, AppError> {
+    let path = PathBuf::from(&file_path);
+    let data = std::fs::read(&path)?;
+    let extension = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("png")
+        .to_string();
+    default_store()?.save_image(&note_id, &data, &extension)
+}
+
+#[tauri::command]
 fn images_get_base_dir() -> Result<String, AppError> {
     let store = default_store()?;
     store
-        .base_dir()
+        .data_dir()
         .to_str()
         .map(str::to_string)
         .ok_or_else(|| AppError {
             code: "path".into(),
-            message: "invalid base dir path".into(),
+            message: "invalid data dir path".into(),
             details: Default::default(),
         })
 }
@@ -184,7 +196,7 @@ fn copy_background_image(_app: AppHandle, source_path: String) -> Result<String,
     }
 
     let store = default_store()?;
-    let dir = store.base_dir().join("backgrounds");
+    let dir = store.data_dir().join("backgrounds");
     fs::create_dir_all(&dir)?;
 
     let old_config = store.load_config()?;
@@ -230,6 +242,21 @@ fn config_save(app: AppHandle, config: AppConfig) -> Result<AppConfig, AppError>
     }
     let _ = app.emit("config-changed", &saved);
     Ok(saved)
+}
+
+#[tauri::command]
+fn config_migrate_data_dir(app: AppHandle, new_data_dir: String) -> Result<AppConfig, AppError> {
+    let store = default_store()?;
+    let new_path = PathBuf::from(&new_data_dir).join("floral");
+    let new_store = store.migrate_data_to(&new_path)?;
+
+    let scope = app.asset_protocol_scope();
+    let _ = scope.allow_directory(new_path.join("images"), true);
+    let _ = scope.allow_directory(new_path.join("backgrounds"), true);
+
+    let config = new_store.load_config()?;
+    let _ = app.emit("config-changed", &config);
+    Ok(config)
 }
 
 #[tauri::command]
@@ -302,9 +329,73 @@ fn take_startup_file() -> Option<String> {
     desktop::take_startup_file()
 }
 
+fn cli_version_or_help_requested() -> bool {
+    env::args().any(|arg| matches!(arg.as_str(), "--version" | "-V" | "--help" | "-h"))
+}
+
+#[cfg(windows)]
+fn ensure_console() {
+    use windows_sys::Win32::System::Console::{AllocConsole, AttachConsole, ATTACH_PARENT_PROCESS};
+
+    unsafe {
+        if AttachConsole(ATTACH_PARENT_PROCESS) == 0 {
+            let _ = AllocConsole();
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn ensure_console() {}
+
+fn flush_attached_console_stdout() {
+    let _ = std::io::stdout().flush();
+}
+
+fn print_cli_version() {
+    let _ = writeln!(
+        std::io::stdout(),
+        "floral-notepaper {}",
+        env!("CARGO_PKG_VERSION")
+    );
+    flush_attached_console_stdout();
+}
+
+fn print_cli_help() {
+    let _ = writeln!(
+        std::io::stdout(),
+        "floral-notepaper {}\nFloral Notepaper - lightweight local note app\n\nUSAGE:\n    floral-notepaper [OPTIONS]\n\nOPTIONS:\n    -V, --version\n            Print version\n    -h, --help\n            Print help",
+        env!("CARGO_PKG_VERSION"),
+    );
+    flush_attached_console_stdout();
+}
+
+pub fn try_exit_for_cli_version_or_help() {
+    if !cli_version_or_help_requested() {
+        return;
+    }
+
+    ensure_console();
+
+    let wants_version = env::args().any(|arg| arg == "--version" || arg == "-V");
+    let wants_help = env::args().any(|arg| arg == "--help" || arg == "-h");
+
+    if wants_version {
+        print_cli_version();
+        std::process::exit(0);
+    }
+
+    if wants_help {
+        print_cli_help();
+        std::process::exit(0);
+    }
+
+    std::process::exit(0);
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_cli::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_opener::init())
@@ -316,10 +407,10 @@ pub fn run() {
         }))
         .setup(|app| {
             if let Ok(store) = default_store() {
-                let base = store.base_dir();
+                let data = store.data_dir();
                 let scope = app.asset_protocol_scope();
-                let _ = scope.allow_directory(base.join("images"), true);
-                let _ = scope.allow_directory(base.join("backgrounds"), true);
+                let _ = scope.allow_directory(data.join("images"), true);
+                let _ = scope.allow_directory(data.join("backgrounds"), true);
             }
             let updater_state = updater::UpdaterState::new(app.package_info().version.to_string());
             if let Err(error) = updater_state.initialize() {
@@ -349,11 +440,13 @@ pub fn run() {
             categories_rename,
             categories_delete,
             images_save,
+            images_save_from_path,
             images_get_base_dir,
             images_clean_unused,
             config_get,
             copy_background_image,
             config_save,
+            config_migrate_data_dir,
             global_shortcut_check,
             start_shortcut_recording,
             stop_shortcut_recording,
@@ -375,6 +468,20 @@ pub fn run() {
             updater::commands::update_cancel,
             take_startup_file
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(move |_app_handle, _event| {
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Reopen {
+                has_visible_windows,
+                ..
+            } = _event
+            {
+                if !has_visible_windows {
+                    if let Err(error) = desktop::show_main_window(_app_handle) {
+                        eprintln!("failed to show main window on dock click: {error}");
+                    }
+                }
+            }
+        });
 }

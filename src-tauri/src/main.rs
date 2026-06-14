@@ -12,5 +12,6 @@ fn main() {
         std::process::exit(exit_code.as_i32());
     }
 
+    floral_notepaper_lib::try_exit_for_cli_version_or_help();
     floral_notepaper_lib::run()
 }

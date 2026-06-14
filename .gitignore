@@ -39,7 +39,6 @@ CLAUDE.md
 *ANALYSIS.md
 .claude
 
-## 已从仓库历史清除的本地文件
 src/assets/fonts/SourceHanSerifSC-Bold.woff2
 
 ## IDE
@@ -58,6 +57,9 @@ Desktop.ini
 *.ai
 *.icon
 src-tauri/icons/macOS
+
+## Generated
+src/generated/contributors.json
 
 ## Temp
 temp/

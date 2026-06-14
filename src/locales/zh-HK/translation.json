@@ -170,6 +170,11 @@
       "clear": "清除"
     },
     "emptyState": "還沒有可開啟的筆記",
+    "search": {
+      "clear": "清除搜尋",
+      "noResults": "沒有符合的筆記",
+      "placeholder": "搜尋筆記…"
+    },
     "error": {
       "copyUnsupported": "目前環境不支援複製"
     },
@@ -221,7 +226,7 @@
       "zhCN": "簡體中文",
       "zhHK": "繁體中文"
     },
-    "notesDir": "筆記目錄",
+    "dataDir": "數據目錄",
     "openAtCursor": "快捷鍵開啟時跟隨滑鼠位置",
     "quickNoteShortcut": "快捷記錄快捷鍵",
     "rememberSurfaceSize": "記住小窗尺寸",

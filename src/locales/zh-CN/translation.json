@@ -170,6 +170,11 @@
       "clear": "清空"
     },
     "emptyState": "还没有可打开的笔记",
+    "search": {
+      "clear": "清空搜索",
+      "noResults": "没有匹配的笔记",
+      "placeholder": "搜索笔记…"
+    },
     "error": {
       "copyUnsupported": "当前环境不支持复制"
     },
@@ -221,7 +226,7 @@
       "zhCN": "简体中文",
       "zhHK": "繁體中文"
     },
-    "notesDir": "笔记目录",
+    "dataDir": "数据目录",
     "openAtCursor": "快捷键打开时跟随鼠标位置",
     "quickNoteShortcut": "快捷记录快捷键",
     "rememberSurfaceSize": "记住小窗尺寸",

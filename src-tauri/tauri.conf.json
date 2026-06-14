@@ -22,7 +22,7 @@
         "decorations": false,
         "transparent": true,
         "visible": false,
-        "dragDropEnabled": false
+        "dragDropEnabled": true
       }
     ],
     "security": {
@@ -74,5 +74,11 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ]
+  },
+  "plugins": {
+    "cli": {
+      "description": "Floral Notepaper - lightweight local note app",
+      "args": []
+    }
   }
 }
