@@ -2835,32 +2835,6 @@ export function MainWindow({
                 )}
               </div>
 
-              <button
-                onClick={() => setTocOpen((prev) => !prev)}
-                className={`w-7 h-7 flex items-center justify-center rounded-lg transition-all cursor-pointer ${
-                  tocOpen
-                    ? "text-bamboo bg-bamboo-mist/50"
-                    : "text-ink-ghost hover:text-ink-faint hover:bg-paper-warm"
-                }`}
-                title={t("main.toc.toggle", { defaultValue: "切换目录" })}
-              >
-                <svg
-                  width="14"
-                  height="14"
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="2"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                >
-                  <line x1="3" y1="6" x2="15" y2="6" />
-                  <line x1="3" y1="12" x2="21" y2="12" />
-                  <line x1="3" y1="18" x2="18" y2="18" />
-                  <polyline points="17 4 19 6 17 8" />
-                </svg>
-              </button>
-
               <SlidingButtonGroup
                 options={viewModeOptions}
                 value={viewMode}
@@ -3056,6 +3030,18 @@ export function MainWindow({
                 <span className="text-[10px] text-ink-ghost font-mono">
                   {t("main.statusBar.format", { defaultValue: "Markdown + LaTeX" })}
                 </span>
+                <span className="text-[10px] text-ink-ghost/40">|</span>
+                <button
+                  type="button"
+                  onClick={() => setTocOpen((prev) => !prev)}
+                  className={`text-[10px] font-mono cursor-pointer transition-colors ${
+                    tocOpen
+                      ? "text-bamboo"
+                      : "text-ink-ghost hover:text-bamboo"
+                  }`}
+                >
+                  {t("main.toc.toggle", { defaultValue: "目录" })}
+                </button>
               </div>
               <div className="flex items-center gap-3">
                 {selectedId && !isExternal && content.includes("images/") && (
