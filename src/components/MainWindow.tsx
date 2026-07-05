@@ -36,6 +36,7 @@ import type {
   UpdateState,
 } from "../features/update/types";
 import { BackgroundLayer } from "./BackgroundLayer";
+import { TocPanel, type TocHeading } from "./TocPanel";
 import { SettingsPanel } from "./SettingsPanel";
 import { SlidingButtonGroup } from "./SlidingButtonGroup";
 import {
@@ -331,6 +332,7 @@ export function MainWindow({
     normalizeViewMode(initialConfig?.defaultViewMode ?? "split"),
   );
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [tocOpen, setTocOpen] = useState(false);
   const [content, setContent] = useState("");
   const [title, setTitle] = useState("");
   const [saveState, setSaveState] = useState<SaveState>("idle");
@@ -511,6 +513,33 @@ export function MainWindow({
       },
     ],
     [t],
+  );
+  const handleTocClick = useCallback(
+    (heading: TocHeading) => {
+      // 预览/分栏模式：通过 slug 定位 DOM 元素并平滑滚动
+      if (viewMode === "preview" || viewMode === "split") {
+        const el = document.getElementById(heading.slug);
+        if (el) {
+          el.scrollIntoView({ behavior: "smooth", block: "start" });
+          return;
+        }
+      }
+      // 编辑模式：将 textarea 滚动到对应行
+      const ta = contentRef.current;
+      if (!ta) return;
+      const lines = content.split("\n");
+      let charIndex = 0;
+      for (let i = 0; i < heading.line && i < lines.length; i++) {
+        charIndex += lines[i].length + 1; // +1 for '\n'
+      }
+      ta.focus();
+      ta.setSelectionRange(charIndex, charIndex);
+      // 计算该行所在的滚动位置
+      const lineHeight = parseFloat(getComputedStyle(ta).lineHeight) || 28;
+      const targetScroll = heading.line * lineHeight - ta.clientHeight / 3;
+      ta.scrollTop = Math.max(0, targetScroll);
+    },
+    [content, viewMode],
   );
   const viewModeOptions = useMemo(
     () => [
@@ -2806,6 +2835,32 @@ export function MainWindow({
                 )}
               </div>
 
+              <button
+                onClick={() => setTocOpen((prev) => !prev)}
+                className={`w-7 h-7 flex items-center justify-center rounded-lg transition-all cursor-pointer ${
+                  tocOpen
+                    ? "text-bamboo bg-bamboo-mist/50"
+                    : "text-ink-ghost hover:text-ink-faint hover:bg-paper-warm"
+                }`}
+                title={t("main.toc.toggle", { defaultValue: "切换目录" })}
+              >
+                <svg
+                  width="14"
+                  height="14"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                >
+                  <line x1="3" y1="6" x2="15" y2="6" />
+                  <line x1="3" y1="12" x2="21" y2="12" />
+                  <line x1="3" y1="18" x2="18" y2="18" />
+                  <polyline points="17 4 19 6 17 8" />
+                </svg>
+              </button>
+
               <SlidingButtonGroup
                 options={viewModeOptions}
                 value={viewMode}
@@ -2877,6 +2932,12 @@ export function MainWindow({
                 </div>
               ) : (
                 <>
+                  <TocPanel
+                    content={content}
+                    onClickHeading={handleTocClick}
+                    visible={tocOpen}
+                    onClose={() => setTocOpen(false)}
+                  />
                   {(viewMode === "edit" || viewMode === "split") && (
                     <div
                       className="flex flex-col min-h-0 shrink-0"
