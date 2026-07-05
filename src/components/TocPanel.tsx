@@ -108,9 +108,7 @@ export function TocPanel({ content, onClickHeading, visible, onClose }: TocPanel
   return (
     <div className="toc-panel">
       <div className="toc-panel-header">
-        <span className="toc-panel-title">
-          {t("main.toc.title", { defaultValue: "目录" })}
-        </span>
+        <span className="toc-panel-title">{t("main.toc.title", { defaultValue: "目录" })}</span>
         <button
           type="button"
           onClick={onClose}
@@ -133,9 +131,7 @@ export function TocPanel({ content, onClickHeading, visible, onClose }: TocPanel
 
       <div className="toc-panel-body">
         {headings.length === 0 ? (
-          <p className="toc-panel-empty">
-            {t("main.toc.empty", { defaultValue: "暂无标题" })}
-          </p>
+          <p className="toc-panel-empty">{t("main.toc.empty", { defaultValue: "暂无标题" })}</p>
         ) : (
           <ul className="toc-panel-list">
             {headings.map((heading, index) => (

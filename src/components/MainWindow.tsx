@@ -3035,9 +3035,7 @@ export function MainWindow({
                   type="button"
                   onClick={() => setTocOpen((prev) => !prev)}
                   className={`text-[10px] font-mono cursor-pointer transition-colors ${
-                    tocOpen
-                      ? "text-bamboo"
-                      : "text-ink-ghost hover:text-bamboo"
+                    tocOpen ? "text-bamboo" : "text-ink-ghost hover:text-bamboo"
                   }`}
                 >
                   {t("main.toc.toggle", { defaultValue: "目录" })}
