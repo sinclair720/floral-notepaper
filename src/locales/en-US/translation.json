@@ -269,6 +269,7 @@
     "tileSaveReturnsToPin": "Return to tile after saving",
     "renderHtmlMarkdown": "Render HTML tags in Markdown",
     "splitScrollSync": "Split view scroll sync",
+    "sidebarCollapsedByDefault": "Collapse sidebar on startup",
     "title": "Settings",
     "update": {
       "advanced": "Advanced",

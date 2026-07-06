@@ -218,6 +218,11 @@ export function SettingsPanel({ config, onChange, onMigrateDataDir, onClose }: S
             checked={config.splitScrollSync ?? true}
             onChange={(checked) => setConfigValue("splitScrollSync", checked)}
           />
+          <ToggleRow
+            label={t("settings.sidebarCollapsedByDefault", { defaultValue: "启动时收起侧栏" })}
+            checked={config.sidebarCollapsedByDefault ?? false}
+            onChange={(checked) => setConfigValue("sidebarCollapsedByDefault", checked)}
+          />
         </section>
 
         {/* 快捷键功能设置区域，与上方常规设置分开 */}
