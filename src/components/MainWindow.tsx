@@ -332,10 +332,41 @@ export function MainWindow({
   );
   const [animating, setAnimating] = useState(false);
 
-  const handleViewModeChange = useCallback((nextMode: ViewMode) => {
-    setViewMode(nextMode);
-    setAnimating(true);
-  }, []);
+  const handleViewModeChange = useCallback(
+    (nextMode: ViewMode) => {
+      const prev = viewMode;
+
+      if (contentRef.current) {
+        editorScrollTopRef.current = contentRef.current.scrollTop;
+      }
+      if (previewScrollRef.current) {
+        previewScrollTopRef.current = previewScrollRef.current.scrollTop;
+      }
+
+      if (prev === "preview" && nextMode === "edit") {
+        const preview = previewScrollRef.current;
+        if (preview) {
+          const elements = preview.querySelectorAll<HTMLElement>("[data-block-index]");
+          if (elements.length > 0) {
+            const containerRect = preview.getBoundingClientRect();
+            let topDomIndex = 0;
+            for (const el of elements) {
+              const rect = el.getBoundingClientRect();
+              if (rect.bottom > containerRect.top + 1) {
+                topDomIndex = parseInt(el.getAttribute("data-block-index")!, 10);
+                break;
+              }
+            }
+            pendingScrollToBlockIdxRef.current = topDomIndex;
+          }
+        }
+      }
+
+      setViewMode(nextMode);
+      setAnimating(true);
+    },
+    [viewMode],
+  );
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [content, setContent] = useState("");
   const [title, setTitle] = useState("");
@@ -393,6 +424,9 @@ export function MainWindow({
   const measureControllerRef = useRef<AbortController | null>(null);
   const prevSelectedIdRef = useRef(selectedId);
   const prevViewModeRef = useRef<ViewMode>(viewMode);
+  const editorScrollTopRef = useRef(0);
+  const previewScrollTopRef = useRef(0);
+  const pendingScrollToBlockIdxRef = useRef<number | null>(null);
   const externalFileMtimeRef = useRef<number>(0);
   const lastExternalSaveRef = useRef<number>(0);
   const imageBaseDir = useImageBaseDir();
@@ -1806,6 +1840,8 @@ export function MainWindow({
 
   // Reset preview scroll on note switch
   useEffect(() => {
+    editorScrollTopRef.current = 0;
+    previewScrollTopRef.current = 0;
     if (previewScrollRef.current) {
       previewScrollRef.current.scrollTop = 0;
     }
@@ -1818,33 +1854,70 @@ export function MainWindow({
 
     if (prev === viewMode) return;
 
-    // Split mode retains scroll position naturally on both sides because both remain in DOM
-    if (prev === "split" || viewMode === "split") return;
+    const restoreScrollTop = () => {
+      if (contentRef.current) {
+        contentRef.current.scrollTop = editorScrollTopRef.current;
+      }
+      if (previewScrollRef.current) {
+        previewScrollRef.current.scrollTop = previewScrollTopRef.current;
+      }
+    };
+
+    // If transitioning to split mode, restore both scrolls to their last known state
+    if (viewMode === "split") {
+      requestAnimationFrame(restoreScrollTop);
+      return;
+    }
+
+    // If transitioning from split mode, the visible one keeps its scroll position naturally
+    if (prev === "split") {
+      requestAnimationFrame(restoreScrollTop);
+      return;
+    }
 
     if (prev === "edit" && viewMode === "preview") {
       const textarea = contentRef.current;
       const preview = previewScrollRef.current;
       if (textarea && preview) {
-        const maxScroll = textarea.scrollHeight - textarea.clientHeight;
-        const ratio = maxScroll > 0 ? textarea.scrollTop / maxScroll : 0;
-        requestAnimationFrame(() => {
-          preview.scrollTop = ratio * (preview.scrollHeight - preview.clientHeight);
-        });
+        tagPreviewBlocks(preview);
+
+        measureBlockOffsets(content, textarea)
+          .then((offsets) => {
+            const blockIdx = blockIndexAtOffset(offsets, editorScrollTopRef.current);
+            const el = preview.querySelector<HTMLElement>(`[data-block-index="${blockIdx}"]`);
+            if (el) {
+              requestAnimationFrame(() => {
+                el.scrollIntoView({ block: "start", behavior: "instant" });
+                previewScrollTopRef.current = preview.scrollTop;
+              });
+            }
+          })
+          .catch(() => {});
       }
     } else if (prev === "preview" && viewMode === "edit") {
       const textarea = contentRef.current;
       const preview = previewScrollRef.current;
       if (textarea && preview) {
-        const maxScroll = preview.scrollHeight - preview.clientHeight;
-        const ratio = maxScroll > 0 ? preview.scrollTop / maxScroll : 0;
-        requestAnimationFrame(() => {
-          textarea.scrollTop = ratio * (textarea.scrollHeight - textarea.clientHeight);
-        });
+        measureBlockOffsets(content, textarea)
+          .then((offsets) => {
+            const blockIdx = pendingScrollToBlockIdxRef.current;
+            if (blockIdx !== null && blockIdx < offsets.length) {
+              pendingScrollToBlockIdxRef.current = null;
+              requestAnimationFrame(() => {
+                textarea.scrollTop = offsets[blockIdx];
+                editorScrollTopRef.current = textarea.scrollTop;
+              });
+            }
+          })
+          .catch(() => {});
       }
     }
-  }, [viewMode]);
+  }, [viewMode, content]);
 
   const handleEditorScroll = useCallback(() => {
+    if (contentRef.current) {
+      editorScrollTopRef.current = contentRef.current.scrollTop;
+    }
     if (viewMode !== "split") return;
     if (scrollSource.current === "preview") return;
 
@@ -1869,6 +1942,9 @@ export function MainWindow({
   }, [viewMode]);
 
   const handlePreviewScroll = useCallback(() => {
+    if (previewScrollRef.current) {
+      previewScrollTopRef.current = previewScrollRef.current.scrollTop;
+    }
     if (viewMode !== "split") return;
     if (scrollSource.current === "editor") return;
 
