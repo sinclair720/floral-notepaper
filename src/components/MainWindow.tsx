@@ -330,6 +330,12 @@ export function MainWindow({
   const [viewMode, setViewMode] = useState<ViewMode>(
     normalizeViewMode(initialConfig?.defaultViewMode ?? "split"),
   );
+  const [animating, setAnimating] = useState(false);
+
+  const handleViewModeChange = useCallback((nextMode: ViewMode) => {
+    setViewMode(nextMode);
+    setAnimating(true);
+  }, []);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [content, setContent] = useState("");
   const [title, setTitle] = useState("");
@@ -386,6 +392,7 @@ export function MainWindow({
   const measureRafRef = useRef<number>(0);
   const measureControllerRef = useRef<AbortController | null>(null);
   const prevSelectedIdRef = useRef(selectedId);
+  const prevViewModeRef = useRef<ViewMode>(viewMode);
   const externalFileMtimeRef = useRef<number>(0);
   const lastExternalSaveRef = useRef<number>(0);
   const imageBaseDir = useImageBaseDir();
@@ -1804,6 +1811,39 @@ export function MainWindow({
     }
   }, [selectedId]);
 
+  // Map scroll position when switching between edit and preview modes
+  useEffect(() => {
+    const prev = prevViewModeRef.current;
+    prevViewModeRef.current = viewMode;
+
+    if (prev === viewMode) return;
+
+    // Split mode retains scroll position naturally on both sides because both remain in DOM
+    if (prev === "split" || viewMode === "split") return;
+
+    if (prev === "edit" && viewMode === "preview") {
+      const textarea = contentRef.current;
+      const preview = previewScrollRef.current;
+      if (textarea && preview) {
+        const maxScroll = textarea.scrollHeight - textarea.clientHeight;
+        const ratio = maxScroll > 0 ? textarea.scrollTop / maxScroll : 0;
+        requestAnimationFrame(() => {
+          preview.scrollTop = ratio * (preview.scrollHeight - preview.clientHeight);
+        });
+      }
+    } else if (prev === "preview" && viewMode === "edit") {
+      const textarea = contentRef.current;
+      const preview = previewScrollRef.current;
+      if (textarea && preview) {
+        const maxScroll = preview.scrollHeight - preview.clientHeight;
+        const ratio = maxScroll > 0 ? preview.scrollTop / maxScroll : 0;
+        requestAnimationFrame(() => {
+          textarea.scrollTop = ratio * (textarea.scrollHeight - textarea.clientHeight);
+        });
+      }
+    }
+  }, [viewMode]);
+
   const handleEditorScroll = useCallback(() => {
     if (viewMode !== "split") return;
     if (scrollSource.current === "preview") return;
@@ -2809,7 +2849,7 @@ export function MainWindow({
               <SlidingButtonGroup
                 options={viewModeOptions}
                 value={viewMode}
-                onChange={setViewMode}
+                onChange={handleViewModeChange}
                 buttonClassName="px-3 py-1"
               />
             </div>
@@ -2867,9 +2907,9 @@ export function MainWindow({
             </div>
 
             <div
-              key={viewMode}
               ref={splitContainerRef}
-              className="flex-1 flex min-h-0 animate-view-fade"
+              className={`flex-1 flex min-h-0 ${animating ? "animate-view-fade" : ""}`}
+              onAnimationEnd={() => setAnimating(false)}
             >
               {!selectedId && !isLoading ? (
                 <div className="flex-1 flex items-center justify-center text-[13px] text-ink-ghost">
@@ -2877,62 +2917,63 @@ export function MainWindow({
                 </div>
               ) : (
                 <>
-                  {(viewMode === "edit" || viewMode === "split") && (
-                    <div
-                      className="flex flex-col min-h-0 shrink-0"
-                      style={{ width: viewMode === "split" ? `${splitRatio * 100}%` : "100%" }}
-                    >
-                      <div className="flex items-center gap-0.5 px-4 pt-2 pb-1 shrink-0">
-                        {toolbarButtons.map((button) => (
-                          <button
-                            key={button.label}
-                            title={button.title}
-                            onMouseDown={(e) => e.preventDefault()}
-                            onClick={() => {
-                              if (contentRef.current) {
-                                applyFormat(
-                                  contentRef.current,
-                                  button.action,
-                                  t,
-                                  setContent,
-                                  markDirty,
-                                );
-                              }
-                            }}
-                            className={`w-6 h-6 flex items-center justify-center rounded text-[11px] text-ink-ghost hover:text-ink-faint hover:bg-paper-warm transition-all cursor-pointer ${button.style}`}
-                          >
-                            {button.label}
-                          </button>
-                        ))}
-                      </div>
-
-                      <div className="flex-1 overflow-hidden px-5 pb-4">
-                        <textarea
-                          ref={contentRef}
-                          data-tab-indent="true"
-                          value={content}
-                          onChange={(event) => {
-                            setContent(event.target.value);
-                            markDirty();
+                  <div
+                    className="flex flex-col min-h-0 shrink-0"
+                    style={{
+                      width: viewMode === "split" ? `${splitRatio * 100}%` : "100%",
+                      display: viewMode === "edit" || viewMode === "split" ? undefined : "none",
+                    }}
+                  >
+                    <div className="flex items-center gap-0.5 px-4 pt-2 pb-1 shrink-0">
+                      {toolbarButtons.map((button) => (
+                        <button
+                          key={button.label}
+                          title={button.title}
+                          onMouseDown={(e) => e.preventDefault()}
+                          onClick={() => {
+                            if (contentRef.current) {
+                              applyFormat(
+                                contentRef.current,
+                                button.action,
+                                t,
+                                setContent,
+                                markDirty,
+                              );
+                            }
                           }}
-                          onPaste={imagePasteHandler}
-                          onDrop={imageDropHandler}
-                          onDragOver={imageDragOverHandler}
-                          onScroll={handleEditorScroll}
-                          className="w-full h-full leading-[1.9] text-ink-soft font-body placeholder:text-ink-ghost/40"
-                          style={{
-                            fontSize: `${settingsConfig?.fontSize ?? 14}px`,
-                            tabSize: `var(--tab-indent-size, 2)`,
-                          }}
-                          placeholder={t("main.editor.contentPlaceholder", {
-                            defaultValue: "开始写作……",
-                          })}
-                          spellCheck={false}
-                          disabled={!selectedId}
-                        />
-                      </div>
+                          className={`w-6 h-6 flex items-center justify-center rounded text-[11px] text-ink-ghost hover:text-ink-faint hover:bg-paper-warm transition-all cursor-pointer ${button.style}`}
+                        >
+                          {button.label}
+                        </button>
+                      ))}
                     </div>
-                  )}
+
+                    <div className="flex-1 overflow-hidden px-5 pb-4">
+                      <textarea
+                        ref={contentRef}
+                        data-tab-indent="true"
+                        value={content}
+                        onChange={(event) => {
+                          setContent(event.target.value);
+                          markDirty();
+                        }}
+                        onPaste={imagePasteHandler}
+                        onDrop={imageDropHandler}
+                        onDragOver={imageDragOverHandler}
+                        onScroll={handleEditorScroll}
+                        className="w-full h-full leading-[1.9] text-ink-soft font-body placeholder:text-ink-ghost/40"
+                        style={{
+                          fontSize: `${settingsConfig?.fontSize ?? 14}px`,
+                          tabSize: `var(--tab-indent-size, 2)`,
+                        }}
+                        placeholder={t("main.editor.contentPlaceholder", {
+                          defaultValue: "开始写作……",
+                        })}
+                        spellCheck={false}
+                        disabled={!selectedId}
+                      />
+                    </div>
+                  </div>
 
                   {viewMode === "split" && (
                     <div
@@ -2954,31 +2995,34 @@ export function MainWindow({
                     </div>
                   )}
 
-                  {(viewMode === "preview" || viewMode === "split") && (
-                    <div className="flex flex-col min-h-0 min-w-0 flex-1">
-                      {viewMode === "split" && (
-                        <div className="px-4 pt-2.5 pb-1 shrink-0">
-                          <span className="text-[10px] text-ink-ghost/60 font-mono tracking-widest uppercase">
-                            {t("main.editor.previewLabel", { defaultValue: "Preview" })}
-                          </span>
-                        </div>
-                      )}
-                      <div
-                        ref={previewScrollRef}
-                        onScroll={handlePreviewScroll}
-                        className={`flex-1 overflow-y-auto px-6 pb-6 ${
-                          viewMode === "preview" ? "pt-3" : "pt-1"
-                        }`}
-                      >
-                        <MarkdownPreview
-                          content={content}
-                          fontSize={settingsConfig?.fontSize ?? 14}
-                          renderHtml={settingsConfig?.renderHtmlMarkdown ?? false}
-                          imageBaseDir={imageBaseDir ?? undefined}
-                        />
+                  <div
+                    className="flex flex-col min-h-0 min-w-0 flex-1"
+                    style={{
+                      display: viewMode === "preview" || viewMode === "split" ? undefined : "none",
+                    }}
+                  >
+                    {viewMode === "split" && (
+                      <div className="px-4 pt-2.5 pb-1 shrink-0">
+                        <span className="text-[10px] text-ink-ghost/60 font-mono tracking-widest uppercase">
+                          {t("main.editor.previewLabel", { defaultValue: "Preview" })}
+                        </span>
                       </div>
+                    )}
+                    <div
+                      ref={previewScrollRef}
+                      onScroll={handlePreviewScroll}
+                      className={`flex-1 overflow-y-auto px-6 pb-6 ${
+                        viewMode === "preview" ? "pt-3" : "pt-1"
+                      }`}
+                    >
+                      <MarkdownPreview
+                        content={content}
+                        fontSize={settingsConfig?.fontSize ?? 14}
+                        renderHtml={settingsConfig?.renderHtmlMarkdown ?? false}
+                        imageBaseDir={imageBaseDir ?? undefined}
+                      />
                     </div>
-                  )}
+                  </div>
                 </>
               )}
             </div>
