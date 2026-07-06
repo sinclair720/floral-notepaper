@@ -871,3 +871,73 @@ input::placeholder {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+
+/* TOC panel actions (header right side) */
+.toc-panel-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+/* 全部折叠/展开按钮 */
+.toc-panel-collapse-all {
+  width: 20px;
+  height: 20px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 6px;
+  color: var(--color-ink-ghost);
+  cursor: pointer;
+  transition: all 0.15s ease;
+  background: transparent;
+  border: none;
+}
+.toc-panel-collapse-all:hover {
+  color: var(--color-ink-faint);
+  background: var(--color-paper-warm);
+}
+
+/* 每行的容器（折叠按钮 + 标题按钮） */
+.toc-panel-item-row {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  width: 100%;
+}
+
+/* 单个标题的折叠/展开三角按钮 */
+.toc-panel-toggle {
+  width: 16px;
+  height: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  border: none;
+  background: transparent;
+  color: var(--color-ink-ghost);
+  cursor: pointer;
+  border-radius: 3px;
+  transition: all 0.12s ease;
+  padding: 0;
+}
+.toc-panel-toggle:hover {
+  color: var(--color-ink-faint);
+  background: var(--color-paper-warm);
+}
+
+/* 叶子节点的占位符（与折叠按钮同宽，保持对齐） */
+.toc-panel-toggle-spacer {
+  width: 16px;
+  flex-shrink: 0;
+}
+
+/* 三角箭头旋转动画 */
+.toc-toggle-arrow {
+  transition: transform 0.15s ease;
+  transform: rotate(0deg);
+}
+.toc-toggle-arrow-expanded {
+  transform: rotate(90deg);
+}

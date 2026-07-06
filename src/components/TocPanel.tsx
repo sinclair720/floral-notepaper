@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useMemo, useState, useCallback, useEffect } from "react";
 import { useTranslation } from "react-i18next";
 
 /** 表示一个标题条目 */
@@ -93,11 +93,76 @@ function parseHeadings(content: string): TocHeading[] {
   return headings;
 }
 
+/** 返回一个 Set，包含所有拥有子标题的标题 slug */
+function findParentSlugs(headings: TocHeading[]): Set<string> {
+  const parents = new Set<string>();
+  for (let i = 0; i < headings.length - 1; i++) {
+    if (headings[i + 1].level > headings[i].level) {
+      parents.add(headings[i].slug);
+    }
+  }
+  return parents;
+}
+
+/** 判断某个标题是否因为祖先被折叠而应该被隐藏 */
+function isHeadingHidden(
+  index: number,
+  headings: TocHeading[],
+  collapsedSlugs: Set<string>,
+): boolean {
+  const currentLevel = headings[index].level;
+  // 向前遍历，找层级比自己浅的最近祖先
+  for (let i = index - 1; i >= 0; i--) {
+    if (headings[i].level < currentLevel) {
+      if (collapsedSlugs.has(headings[i].slug)) {
+        return true;
+      }
+      // 继续向上检查所有祖先（间接折叠）
+      return isHeadingHidden(i, headings, collapsedSlugs);
+    }
+  }
+  return false;
+}
+
 // ---------- 组件 ----------
 
 export function TocPanel({ content, onClickHeading, visible, onClose }: TocPanelProps) {
   const { t } = useTranslation();
   const headings = useMemo(() => parseHeadings(content), [content]);
+
+  // 折叠状态（存储被折叠的父标题 slug）
+  const [collapsedSlugs, setCollapsedSlugs] = useState<Set<string>>(new Set());
+
+  // 当内容变化（如切换笔记）时，重置折叠状态为全部展开
+  useEffect(() => {
+    setCollapsedSlugs(new Set());
+  }, [content]);
+
+  // 哪些标题是父标题（拥有子标题）
+  const parentSlugs = useMemo(() => findParentSlugs(headings), [headings]);
+
+  // 切换单个标题的折叠状态
+  const toggleCollapse = useCallback((slug: string) => {
+    setCollapsedSlugs((prev) => {
+      const next = new Set(prev);
+      if (next.has(slug)) {
+        next.delete(slug);
+      } else {
+        next.add(slug);
+      }
+      return next;
+    });
+  }, []);
+
+  // 全部展开
+  const expandAll = useCallback(() => {
+    setCollapsedSlugs(new Set());
+  }, []);
+
+  // 全部折叠
+  const collapseAll = useCallback(() => {
+    setCollapsedSlugs(new Set(parentSlugs));
+  }, [parentSlugs]);
 
   if (!visible) return null;
 
@@ -105,28 +170,67 @@ export function TocPanel({ content, onClickHeading, visible, onClose }: TocPanel
   // （如果文档从 ## 开始，则 ## 不缩进，### 缩进 1 级）
   const minLevel = headings.length > 0 ? Math.min(...headings.map((h) => h.level)) : 1;
 
+  const allCollapsed = parentSlugs.size > 0 && collapsedSlugs.size >= parentSlugs.size;
+
   return (
     <div className="toc-panel">
       <div className="toc-panel-header">
         <span className="toc-panel-title">{t("main.toc.title", { defaultValue: "目录" })}</span>
-        <button
-          type="button"
-          onClick={onClose}
-          className="toc-panel-close"
-          title={t("main.toc.close", { defaultValue: "关闭目录" })}
-        >
-          <svg
-            width="12"
-            height="12"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="2.5"
-            strokeLinecap="round"
+        <div className="toc-panel-actions">
+          {parentSlugs.size > 0 && (
+            <button
+              type="button"
+              onClick={allCollapsed ? expandAll : collapseAll}
+              className="toc-panel-collapse-all"
+              title={
+                allCollapsed
+                  ? t("main.toc.expandAll", { defaultValue: "展开全部" })
+                  : t("main.toc.collapseAll", { defaultValue: "折叠全部" })
+              }
+            >
+              <svg
+                width="12"
+                height="12"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                {allCollapsed ? (
+                  <>
+                    <polyline points="7 8 12 13 17 8" />
+                    <polyline points="7 14 12 19 17 14" />
+                  </>
+                ) : (
+                  <>
+                    <polyline points="17 16 12 11 7 16" />
+                    <polyline points="17 10 12 5 7 10" />
+                  </>
+                )}
+              </svg>
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={onClose}
+            className="toc-panel-close"
+            title={t("main.toc.close", { defaultValue: "关闭目录" })}
           >
-            <path d="M18 6L6 18M6 6l12 12" />
-          </svg>
-        </button>
+            <svg
+              width="12"
+              height="12"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2.5"
+              strokeLinecap="round"
+            >
+              <path d="M18 6L6 18M6 6l12 12" />
+            </svg>
+          </button>
+        </div>
       </div>
 
       <div className="toc-panel-body">
@@ -134,22 +238,58 @@ export function TocPanel({ content, onClickHeading, visible, onClose }: TocPanel
           <p className="toc-panel-empty">{t("main.toc.empty", { defaultValue: "暂无标题" })}</p>
         ) : (
           <ul className="toc-panel-list">
-            {headings.map((heading, index) => (
-              <li key={`${heading.slug}-${index}`}>
-                <button
-                  type="button"
-                  onClick={() => onClickHeading(heading)}
-                  className="toc-panel-item"
-                  style={{ paddingLeft: `${(heading.level - minLevel) * 14 + 8}px` }}
-                  title={heading.text}
-                >
-                  <span className="toc-panel-item-marker" data-level={heading.level}>
-                    {heading.level <= 2 ? "◆" : heading.level <= 4 ? "◇" : "·"}
-                  </span>
-                  <span className="toc-panel-item-text">{heading.text}</span>
-                </button>
-              </li>
-            ))}
+            {headings.map((heading, index) => {
+              if (isHeadingHidden(index, headings, collapsedSlugs)) return null;
+
+              const isParent = parentSlugs.has(heading.slug);
+              const isCollapsed = collapsedSlugs.has(heading.slug);
+
+              return (
+                <li key={`${heading.slug}-${index}`}>
+                  <div
+                    className="toc-panel-item-row"
+                    style={{ paddingLeft: `${(heading.level - minLevel) * 14 + 4}px` }}
+                  >
+                    {isParent ? (
+                      <button
+                        type="button"
+                        className="toc-panel-toggle"
+                        onClick={() => toggleCollapse(heading.slug)}
+                        title={isCollapsed ? "展开" : "折叠"}
+                      >
+                        <svg
+                          width="10"
+                          height="10"
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          stroke="currentColor"
+                          strokeWidth="2.5"
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          className={`toc-toggle-arrow ${isCollapsed ? "" : "toc-toggle-arrow-expanded"}`}
+                        >
+                          <polyline points="9 6 15 12 9 18" />
+                        </svg>
+                      </button>
+                    ) : (
+                      <span className="toc-panel-toggle-spacer" />
+                    )}
+
+                    <button
+                      type="button"
+                      onClick={() => onClickHeading(heading)}
+                      className="toc-panel-item"
+                      title={heading.text}
+                    >
+                      <span className="toc-panel-item-marker" data-level={heading.level}>
+                        {heading.level <= 2 ? "◆" : heading.level <= 4 ? "◇" : "·"}
+                      </span>
+                      <span className="toc-panel-item-text">{heading.text}</span>
+                    </button>
+                  </div>
+                </li>
+              );
+            })}
           </ul>
         )}
       </div>
