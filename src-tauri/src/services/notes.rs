@@ -1829,6 +1829,7 @@ mod tests {
             tile_render_markdown: false,
             render_html_markdown: false,
             split_scroll_sync: true,
+            sidebar_collapsed_by_default: false,
             surface_width: None,
             surface_height: None,
             toggle_visibility_shortcut: String::new(),
