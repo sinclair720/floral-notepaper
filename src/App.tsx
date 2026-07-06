@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import "./App.css";
 import { ContextMenuProvider } from "./components/ContextMenu";
 import { MainWindow } from "./components/MainWindow";
@@ -16,19 +16,21 @@ import { listen } from "@tauri-apps/api/event";
 function App() {
   const route = getInitialRoute();
   const activeView = route.view;
+  const [config, setConfig] = useState<AppConfig | null>(null);
 
   useEffect(() => {
     let cleanup = () => {};
     getConfig()
-      .then((config) => {
-        const theme = (config.theme || "system") as ThemeOption;
+      .then((loadedConfig) => {
+        setConfig(loadedConfig);
+        const theme = (loadedConfig.theme || "system") as ThemeOption;
         applyTheme(theme);
         cleanup = watchSystemTheme(theme);
         document.documentElement.style.setProperty(
           "--tab-indent-size",
-          String(config.tabIndentSize ?? 2),
+          String(loadedConfig.tabIndentSize ?? 2),
         );
-        void syncLanguage(config.locale);
+        void syncLanguage(loadedConfig.locale);
       })
       .catch(() => {});
     return () => cleanup();
@@ -78,11 +80,15 @@ function App() {
     return () => document.removeEventListener("keydown", preventSystemMenu, true);
   }, []);
 
+  if (!config) {
+    return null;
+  }
+
   return (
     <ContextMenuProvider>
       <div className="app-window-shell h-screen font-body text-ink overflow-hidden">
         {activeView === "main" ? (
-          <MainWindow />
+          <MainWindow initialConfig={config} />
         ) : activeView === "notepad" ? (
           <NotePad initialNoteId={route.noteId} />
         ) : (

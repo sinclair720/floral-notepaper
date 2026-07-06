@@ -269,6 +269,7 @@
     "tileSaveReturnsToPin": "儲存後回到磁貼",
     "renderHtmlMarkdown": "允許 HTML 標籤渲染",
     "splitScrollSync": "分欄同步捲動",
+    "sidebarCollapsedByDefault": "啟動時收起側欄",
     "title": "應用程式設定",
     "update": {
       "advanced": "進階",

@@ -331,7 +331,9 @@ export function MainWindow({
   const [viewMode, setViewMode] = useState<ViewMode>(
     normalizeViewMode(initialConfig?.defaultViewMode ?? "split"),
   );
-  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(
+    initialConfig?.sidebarCollapsedByDefault ?? false,
+  );
   const [tocOpen, setTocOpen] = useState(false);
   const [content, setContent] = useState("");
   const [title, setTitle] = useState("");
@@ -721,6 +723,7 @@ export function MainWindow({
         setSettingsConfig(loadedConfig);
         setSavedDataDir(loadedConfig.dataDir);
         setViewMode(normalizeViewMode(loadedConfig.defaultViewMode));
+        setSidebarCollapsed(loadedConfig.sidebarCollapsedByDefault ?? false);
         setNotes(loadedNotes);
         setCategories(loadedCategories);
         setCollapsedCategories(new Set(loadedCategories));
@@ -2127,7 +2130,9 @@ export function MainWindow({
 
         <div className="relative z-10 flex flex-1 min-h-0">
           <div
-            className="border-r border-paper-deep/30 bg-paper/40 shrink-0 overflow-hidden transition-[width] duration-[600ms]"
+            className={`border-r border-paper-deep/30 bg-paper/40 shrink-0 overflow-hidden ${
+              isLoading ? "" : "transition-[width] duration-[600ms]"
+            }`}
             style={{ width: sidebarCollapsed ? 0 : sidebarWidth }}
           >
             <div className="flex flex-col h-full" style={{ width: `${sidebarWidth}px` }}>

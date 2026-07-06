@@ -28,6 +28,7 @@ export interface AppConfig {
   tileRenderMarkdown: boolean;
   renderHtmlMarkdown: boolean;
   splitScrollSync: boolean;
+  sidebarCollapsedByDefault: boolean;
   surfaceWidth?: number;
   surfaceHeight?: number;
   toggleVisibilityShortcut: string;

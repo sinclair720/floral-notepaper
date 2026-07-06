@@ -269,6 +269,7 @@
     "tileSaveReturnsToPin": "保存后回到磁贴",
     "renderHtmlMarkdown": "允许 HTML 标签渲染",
     "splitScrollSync": "分栏同步滚动",
+    "sidebarCollapsedByDefault": "启动时收起侧栏",
     "title": "应用设置",
     "update": {
       "advanced": "高级",
