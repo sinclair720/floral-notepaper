@@ -1,5 +1,6 @@
 import { useMemo, useState, useCallback, useEffect } from "react";
 import { useTranslation } from "react-i18next";
+import GithubSlugger from "github-slugger";
 
 /** 表示一个标题条目 */
 interface TocHeading {
@@ -25,22 +26,7 @@ interface TocPanelProps {
 }
 
 // ---------- slug 生成 ----------
-// rehype-slug 使用 github-slugger，其核心算法：
-//   1. 转小写
-//   2. 去除非字母数字和空格（保留中文等 Unicode 字符）
-//   3. 空格替换为 -
-//   4. 重复的 slug 后追加 -1, -2, ...
-// 这里复刻一个轻量版本，确保与渲染后的 id 一致。
-
-function githubSlug(text: string): string {
-  return text
-    .toLowerCase()
-    .trim()
-    .replace(/[^\p{L}\p{N}\s-]/gu, "") // 去除标点和特殊字符，保留字母、数字、空格、连字符
-    .replace(/[\s]+/g, "-") // 空格替换为连字符
-    .replace(/-+/g, "-") // 合并多个连字符
-    .replace(/^-|-$/g, ""); // 去首尾连字符
-}
+// rehype-slug 使用 github-slugger，我们在组件中也直接使用该库生成一致的 ID。
 
 /** 从原始 Markdown 文本中的标题行文字剥离行内 Markdown 格式 */
 function stripInlineMarkdown(text: string): string {
@@ -62,7 +48,7 @@ const HEADING_REGEX = /^(#{1,6})\s+(.+)$/;
 function parseHeadings(content: string): TocHeading[] {
   const lines = content.split("\n");
   const headings: TocHeading[] = [];
-  const slugCounts = new Map<string, number>();
+  const slugger = new GithubSlugger();
   let inCodeBlock = false;
 
   for (let i = 0; i < lines.length; i++) {
@@ -80,12 +66,7 @@ function parseHeadings(content: string): TocHeading[] {
 
     const level = match[1].length;
     const rawText = stripInlineMarkdown(match[2]);
-    const baseSlug = githubSlug(rawText);
-
-    // 处理重复 slug（与 github-slugger 行为一致）
-    const count = slugCounts.get(baseSlug) ?? 0;
-    const slug = count > 0 ? `${baseSlug}-${count}` : baseSlug;
-    slugCounts.set(baseSlug, count + 1);
+    const slug = slugger.slug(rawText);
 
     headings.push({ level, text: rawText, line: i, slug });
   }
