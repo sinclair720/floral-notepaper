@@ -343,9 +343,12 @@ export function MainWindow({
         previewScrollTopRef.current = previewScrollRef.current.scrollTop;
       }
 
-      if (prev === "preview" && nextMode === "edit") {
+      // When leaving preview mode, tag preview blocks first so we can scan
+      // [data-block-index] attributes to find the top visible block.
+      if (prev === "preview" && (nextMode === "edit" || nextMode === "split")) {
         const preview = previewScrollRef.current;
         if (preview) {
+          tagPreviewBlocks(preview);
           const elements = preview.querySelectorAll<HTMLElement>("[data-block-index]");
           if (elements.length > 0) {
             const containerRect = preview.getBoundingClientRect();
@@ -1847,70 +1850,85 @@ export function MainWindow({
     }
   }, [selectedId]);
 
-  // Map scroll position when switching between edit and preview modes
+  // Map scroll position when switching between view modes
   useEffect(() => {
     const prev = prevViewModeRef.current;
     prevViewModeRef.current = viewMode;
 
     if (prev === viewMode) return;
 
-    const restoreScrollTop = () => {
-      if (contentRef.current) {
-        contentRef.current.scrollTop = editorScrollTopRef.current;
-      }
-      if (previewScrollRef.current) {
-        previewScrollRef.current.scrollTop = previewScrollTopRef.current;
-      }
+    const textarea = contentRef.current;
+    const preview = previewScrollRef.current;
+
+    // Helper: scroll the editor to the block captured in pendingScrollToBlockIdxRef
+    const scrollEditorToBlock = () => {
+      if (!textarea) return;
+      measureBlockOffsets(content, textarea)
+        .then((offsets) => {
+          const blockIdx = pendingScrollToBlockIdxRef.current;
+          if (blockIdx !== null && blockIdx < offsets.length) {
+            pendingScrollToBlockIdxRef.current = null;
+            requestAnimationFrame(() => {
+              textarea.scrollTop = offsets[blockIdx];
+              editorScrollTopRef.current = textarea.scrollTop;
+            });
+          }
+        })
+        .catch(() => {});
     };
 
-    // If transitioning to split mode, restore both scrolls to their last known state
-    if (viewMode === "split") {
-      requestAnimationFrame(restoreScrollTop);
+    // Helper: scroll the preview to the block matching the editor's scroll position
+    const scrollPreviewToEditorBlock = () => {
+      if (!textarea || !preview) return;
+      tagPreviewBlocks(preview);
+      measureBlockOffsets(content, textarea)
+        .then((offsets) => {
+          const blockIdx = blockIndexAtOffset(offsets, editorScrollTopRef.current);
+          const el = preview.querySelector<HTMLElement>(`[data-block-index="${blockIdx}"]`);
+          if (el) {
+            requestAnimationFrame(() => {
+              el.scrollIntoView({ block: "start", behavior: "instant" });
+              previewScrollTopRef.current = preview.scrollTop;
+            });
+          }
+        })
+        .catch(() => {});
+    };
+
+    // --- Transitions involving split mode ---
+
+    if (prev === "preview" && viewMode === "split") {
+      // Preview → Split: scroll editor to the block captured in handleViewModeChange;
+      // preview side will be repositioned by the split scroll sync after measurement.
+      scrollEditorToBlock();
       return;
     }
 
-    // If transitioning from split mode, the visible one keeps its scroll position naturally
-    if (prev === "split") {
-      requestAnimationFrame(restoreScrollTop);
+    if (prev === "edit" && viewMode === "split") {
+      // Edit → Split: the editor keeps its position; scroll the preview to match.
+      scrollPreviewToEditorBlock();
       return;
     }
+
+    if (prev === "split") {
+      // Split → Edit or Split → Preview: restore the surviving side's pixel position.
+      requestAnimationFrame(() => {
+        if (viewMode === "edit" && textarea) {
+          textarea.scrollTop = editorScrollTopRef.current;
+        }
+        if (viewMode === "preview" && preview) {
+          preview.scrollTop = previewScrollTopRef.current;
+        }
+      });
+      return;
+    }
+
+    // --- Direct edit ↔ preview transitions ---
 
     if (prev === "edit" && viewMode === "preview") {
-      const textarea = contentRef.current;
-      const preview = previewScrollRef.current;
-      if (textarea && preview) {
-        tagPreviewBlocks(preview);
-
-        measureBlockOffsets(content, textarea)
-          .then((offsets) => {
-            const blockIdx = blockIndexAtOffset(offsets, editorScrollTopRef.current);
-            const el = preview.querySelector<HTMLElement>(`[data-block-index="${blockIdx}"]`);
-            if (el) {
-              requestAnimationFrame(() => {
-                el.scrollIntoView({ block: "start", behavior: "instant" });
-                previewScrollTopRef.current = preview.scrollTop;
-              });
-            }
-          })
-          .catch(() => {});
-      }
+      scrollPreviewToEditorBlock();
     } else if (prev === "preview" && viewMode === "edit") {
-      const textarea = contentRef.current;
-      const preview = previewScrollRef.current;
-      if (textarea && preview) {
-        measureBlockOffsets(content, textarea)
-          .then((offsets) => {
-            const blockIdx = pendingScrollToBlockIdxRef.current;
-            if (blockIdx !== null && blockIdx < offsets.length) {
-              pendingScrollToBlockIdxRef.current = null;
-              requestAnimationFrame(() => {
-                textarea.scrollTop = offsets[blockIdx];
-                editorScrollTopRef.current = textarea.scrollTop;
-              });
-            }
-          })
-          .catch(() => {});
-      }
+      scrollEditorToBlock();
     }
   }, [viewMode, content]);
 
