@@ -335,6 +335,46 @@ export function MainWindow({
     initialConfig?.sidebarCollapsedByDefault ?? false,
   );
   const [tocOpen, setTocOpen] = useState(false);
+  const [animating, setAnimating] = useState(false);
+
+  const handleViewModeChange = useCallback(
+    (nextMode: ViewMode) => {
+      const prev = viewMode;
+
+      if (contentRef.current) {
+        editorScrollTopRef.current = contentRef.current.scrollTop;
+      }
+      if (previewScrollRef.current) {
+        previewScrollTopRef.current = previewScrollRef.current.scrollTop;
+      }
+
+      // When leaving preview mode, tag preview blocks first so we can scan
+      // [data-block-index] attributes to find the top visible block.
+      if (prev === "preview" && (nextMode === "edit" || nextMode === "split")) {
+        const preview = previewScrollRef.current;
+        if (preview) {
+          tagPreviewBlocks(preview);
+          const elements = preview.querySelectorAll<HTMLElement>("[data-block-index]");
+          if (elements.length > 0) {
+            const containerRect = preview.getBoundingClientRect();
+            let topDomIndex = 0;
+            for (const el of elements) {
+              const rect = el.getBoundingClientRect();
+              if (rect.bottom > containerRect.top + 1) {
+                topDomIndex = parseInt(el.getAttribute("data-block-index")!, 10);
+                break;
+              }
+            }
+            pendingScrollToBlockIdxRef.current = topDomIndex;
+          }
+        }
+      }
+
+      setViewMode(nextMode);
+      setAnimating(true);
+    },
+    [viewMode],
+  );
   const [content, setContent] = useState("");
   const [title, setTitle] = useState("");
   const [saveState, setSaveState] = useState<SaveState>("idle");
@@ -390,6 +430,10 @@ export function MainWindow({
   const measureRafRef = useRef<number>(0);
   const measureControllerRef = useRef<AbortController | null>(null);
   const prevSelectedIdRef = useRef(selectedId);
+  const prevViewModeRef = useRef<ViewMode>(viewMode);
+  const editorScrollTopRef = useRef(0);
+  const previewScrollTopRef = useRef(0);
+  const pendingScrollToBlockIdxRef = useRef<number | null>(null);
   const externalFileMtimeRef = useRef<number>(0);
   const lastExternalSaveRef = useRef<number>(0);
   const imageBaseDir = useImageBaseDir();
@@ -1831,12 +1875,99 @@ export function MainWindow({
 
   // Reset preview scroll on note switch
   useEffect(() => {
+    editorScrollTopRef.current = 0;
+    previewScrollTopRef.current = 0;
     if (previewScrollRef.current) {
       previewScrollRef.current.scrollTop = 0;
     }
   }, [selectedId]);
 
+  // Map scroll position when switching between view modes
+  useEffect(() => {
+    const prev = prevViewModeRef.current;
+    prevViewModeRef.current = viewMode;
+
+    if (prev === viewMode) return;
+
+    const textarea = contentRef.current;
+    const preview = previewScrollRef.current;
+
+    // Helper: scroll the editor to the block captured in pendingScrollToBlockIdxRef
+    const scrollEditorToBlock = () => {
+      if (!textarea) return;
+      measureBlockOffsets(content, textarea)
+        .then((offsets) => {
+          const blockIdx = pendingScrollToBlockIdxRef.current;
+          if (blockIdx !== null && blockIdx < offsets.length) {
+            pendingScrollToBlockIdxRef.current = null;
+            requestAnimationFrame(() => {
+              textarea.scrollTop = offsets[blockIdx];
+              editorScrollTopRef.current = textarea.scrollTop;
+            });
+          }
+        })
+        .catch(() => {});
+    };
+
+    // Helper: scroll the preview to the block matching the editor's scroll position
+    const scrollPreviewToEditorBlock = () => {
+      if (!textarea || !preview) return;
+      tagPreviewBlocks(preview);
+      measureBlockOffsets(content, textarea)
+        .then((offsets) => {
+          const blockIdx = blockIndexAtOffset(offsets, editorScrollTopRef.current);
+          const el = preview.querySelector<HTMLElement>(`[data-block-index="${blockIdx}"]`);
+          if (el) {
+            requestAnimationFrame(() => {
+              el.scrollIntoView({ block: "start", behavior: "instant" });
+              previewScrollTopRef.current = preview.scrollTop;
+            });
+          }
+        })
+        .catch(() => {});
+    };
+
+    // --- Transitions involving split mode ---
+
+    if (prev === "preview" && viewMode === "split") {
+      // Preview → Split: scroll editor to the block captured in handleViewModeChange;
+      // preview side will be repositioned by the split scroll sync after measurement.
+      scrollEditorToBlock();
+      return;
+    }
+
+    if (prev === "edit" && viewMode === "split") {
+      // Edit → Split: the editor keeps its position; scroll the preview to match.
+      scrollPreviewToEditorBlock();
+      return;
+    }
+
+    if (prev === "split") {
+      // Split → Edit or Split → Preview: restore the surviving side's pixel position.
+      requestAnimationFrame(() => {
+        if (viewMode === "edit" && textarea) {
+          textarea.scrollTop = editorScrollTopRef.current;
+        }
+        if (viewMode === "preview" && preview) {
+          preview.scrollTop = previewScrollTopRef.current;
+        }
+      });
+      return;
+    }
+
+    // --- Direct edit ↔ preview transitions ---
+
+    if (prev === "edit" && viewMode === "preview") {
+      scrollPreviewToEditorBlock();
+    } else if (prev === "preview" && viewMode === "edit") {
+      scrollEditorToBlock();
+    }
+  }, [viewMode, content]);
+
   const handleEditorScroll = useCallback(() => {
+    if (contentRef.current) {
+      editorScrollTopRef.current = contentRef.current.scrollTop;
+    }
     if (viewMode !== "split") return;
     if (scrollSource.current === "preview") return;
 
@@ -1861,6 +1992,9 @@ export function MainWindow({
   }, [viewMode]);
 
   const handlePreviewScroll = useCallback(() => {
+    if (previewScrollRef.current) {
+      previewScrollTopRef.current = previewScrollRef.current.scrollTop;
+    }
     if (viewMode !== "split") return;
     if (scrollSource.current === "editor") return;
 
@@ -2843,7 +2977,7 @@ export function MainWindow({
               <SlidingButtonGroup
                 options={viewModeOptions}
                 value={viewMode}
-                onChange={setViewMode}
+                onChange={handleViewModeChange}
                 buttonClassName="px-3 py-1"
               />
             </div>
@@ -2901,9 +3035,9 @@ export function MainWindow({
             </div>
 
             <div
-              key={viewMode}
               ref={splitContainerRef}
-              className="flex-1 flex min-h-0 animate-view-fade"
+              className={`flex-1 flex min-h-0 ${animating ? "animate-view-fade" : ""}`}
+              onAnimationEnd={() => setAnimating(false)}
             >
               {!selectedId && !isLoading ? (
                 <div className="flex-1 flex items-center justify-center text-[13px] text-ink-ghost">
@@ -2917,62 +3051,63 @@ export function MainWindow({
                     visible={tocOpen}
                     onClose={() => setTocOpen(false)}
                   />
-                  {(viewMode === "edit" || viewMode === "split") && (
-                    <div
-                      className="flex flex-col min-h-0 shrink-0"
-                      style={{ width: viewMode === "split" ? `${splitRatio * 100}%` : "100%" }}
-                    >
-                      <div className="flex items-center gap-0.5 px-4 pt-2 pb-1 shrink-0">
-                        {toolbarButtons.map((button) => (
-                          <button
-                            key={button.label}
-                            title={button.title}
-                            onMouseDown={(e) => e.preventDefault()}
-                            onClick={() => {
-                              if (contentRef.current) {
-                                applyFormat(
-                                  contentRef.current,
-                                  button.action,
-                                  t,
-                                  setContent,
-                                  markDirty,
-                                );
-                              }
-                            }}
-                            className={`w-6 h-6 flex items-center justify-center rounded text-[11px] text-ink-ghost hover:text-ink-faint hover:bg-paper-warm transition-all cursor-pointer ${button.style}`}
-                          >
-                            {button.label}
-                          </button>
-                        ))}
-                      </div>
-
-                      <div className="flex-1 overflow-hidden px-5 pb-4">
-                        <textarea
-                          ref={contentRef}
-                          data-tab-indent="true"
-                          value={content}
-                          onChange={(event) => {
-                            setContent(event.target.value);
-                            markDirty();
+                  <div
+                    className="flex flex-col min-h-0 shrink-0"
+                    style={{
+                      width: viewMode === "split" ? `${splitRatio * 100}%` : "100%",
+                      display: viewMode === "edit" || viewMode === "split" ? undefined : "none",
+                    }}
+                  >
+                    <div className="flex items-center gap-0.5 px-4 pt-2 pb-1 shrink-0">
+                      {toolbarButtons.map((button) => (
+                        <button
+                          key={button.label}
+                          title={button.title}
+                          onMouseDown={(e) => e.preventDefault()}
+                          onClick={() => {
+                            if (contentRef.current) {
+                              applyFormat(
+                                contentRef.current,
+                                button.action,
+                                t,
+                                setContent,
+                                markDirty,
+                              );
+                            }
                           }}
-                          onPaste={imagePasteHandler}
-                          onDrop={imageDropHandler}
-                          onDragOver={imageDragOverHandler}
-                          onScroll={handleEditorScroll}
-                          className="w-full h-full leading-[1.9] text-ink-soft font-body placeholder:text-ink-ghost/40"
-                          style={{
-                            fontSize: `${settingsConfig?.fontSize ?? 14}px`,
-                            tabSize: `var(--tab-indent-size, 2)`,
-                          }}
-                          placeholder={t("main.editor.contentPlaceholder", {
-                            defaultValue: "开始写作……",
-                          })}
-                          spellCheck={false}
-                          disabled={!selectedId}
-                        />
-                      </div>
+                          className={`w-6 h-6 flex items-center justify-center rounded text-[11px] text-ink-ghost hover:text-ink-faint hover:bg-paper-warm transition-all cursor-pointer ${button.style}`}
+                        >
+                          {button.label}
+                        </button>
+                      ))}
                     </div>
-                  )}
+
+                    <div className="flex-1 overflow-hidden px-5 pb-4">
+                      <textarea
+                        ref={contentRef}
+                        data-tab-indent="true"
+                        value={content}
+                        onChange={(event) => {
+                          setContent(event.target.value);
+                          markDirty();
+                        }}
+                        onPaste={imagePasteHandler}
+                        onDrop={imageDropHandler}
+                        onDragOver={imageDragOverHandler}
+                        onScroll={handleEditorScroll}
+                        className="w-full h-full leading-[1.9] text-ink-soft font-body placeholder:text-ink-ghost/40"
+                        style={{
+                          fontSize: `${settingsConfig?.fontSize ?? 14}px`,
+                          tabSize: `var(--tab-indent-size, 2)`,
+                        }}
+                        placeholder={t("main.editor.contentPlaceholder", {
+                          defaultValue: "开始写作……",
+                        })}
+                        spellCheck={false}
+                        disabled={!selectedId}
+                      />
+                    </div>
+                  </div>
 
                   {viewMode === "split" && (
                     <div
@@ -2994,31 +3129,34 @@ export function MainWindow({
                     </div>
                   )}
 
-                  {(viewMode === "preview" || viewMode === "split") && (
-                    <div className="flex flex-col min-h-0 min-w-0 flex-1">
-                      {viewMode === "split" && (
-                        <div className="px-4 pt-2.5 pb-1 shrink-0">
-                          <span className="text-[10px] text-ink-ghost/60 font-mono tracking-widest uppercase">
-                            {t("main.editor.previewLabel", { defaultValue: "Preview" })}
-                          </span>
-                        </div>
-                      )}
-                      <div
-                        ref={previewScrollRef}
-                        onScroll={handlePreviewScroll}
-                        className={`flex-1 overflow-y-auto px-6 pb-6 ${
-                          viewMode === "preview" ? "pt-3" : "pt-1"
-                        }`}
-                      >
-                        <MarkdownPreview
-                          content={content}
-                          fontSize={settingsConfig?.fontSize ?? 14}
-                          renderHtml={settingsConfig?.renderHtmlMarkdown ?? false}
-                          imageBaseDir={imageBaseDir ?? undefined}
-                        />
+                  <div
+                    className="flex flex-col min-h-0 min-w-0 flex-1"
+                    style={{
+                      display: viewMode === "preview" || viewMode === "split" ? undefined : "none",
+                    }}
+                  >
+                    {viewMode === "split" && (
+                      <div className="px-4 pt-2.5 pb-1 shrink-0">
+                        <span className="text-[10px] text-ink-ghost/60 font-mono tracking-widest uppercase">
+                          {t("main.editor.previewLabel", { defaultValue: "Preview" })}
+                        </span>
                       </div>
+                    )}
+                    <div
+                      ref={previewScrollRef}
+                      onScroll={handlePreviewScroll}
+                      className={`flex-1 overflow-y-auto px-6 pb-6 ${
+                        viewMode === "preview" ? "pt-3" : "pt-1"
+                      }`}
+                    >
+                      <MarkdownPreview
+                        content={content}
+                        fontSize={settingsConfig?.fontSize ?? 14}
+                        renderHtml={settingsConfig?.renderHtmlMarkdown ?? false}
+                        imageBaseDir={imageBaseDir ?? undefined}
+                      />
                     </div>
-                  )}
+                  </div>
                 </>
               )}
             </div>
